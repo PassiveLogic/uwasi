@@ -101,6 +101,14 @@ export class WASIAbi {
    */
   static readonly WASI_ERRNO_INVAL = 28;
   /**
+   * File too large.
+   */
+  static readonly WASI_ERRNO_FBIG = 22;
+  /**
+   * No space left on device.
+   */
+  static readonly WASI_ERRNO_NOSPC = 51;
+  /**
    * Too many levels of symbolic links.
    */
   static readonly WASI_ERRNO_LOOP = 32;
