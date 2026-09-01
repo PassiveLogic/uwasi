@@ -740,13 +740,16 @@ function statOf(node: FSNode): {
  * raised inside an import unwinds through the guest and traps the module,
  * which leaves the guest no way to see the error or recover from it.
  */
+const MAX_FILE_SIZE = Number.MAX_SAFE_INTEGER;
+
 function resizeFile(node: FileNode, size: number): number {
+  // Anything that is not a whole, non-negative count of bytes is a bad
+  // argument, whatever its magnitude: `NaN`, a fraction, `Infinity`, or a
+  // negative. Only a well-formed size that is simply too big is a large file.
+  if (!Number.isInteger(size) || size < 0) return WASIAbi.WASI_ERRNO_INVAL;
   // Above 2^53 a size no longer survives the trip through a JS number, so it
-  // cannot be honoured or reported back accurately.
-  if (!Number.isSafeInteger(size)) {
-    return size < 0 ? WASIAbi.WASI_ERRNO_INVAL : WASIAbi.WASI_ERRNO_FBIG;
-  }
-  if (size < 0) return WASIAbi.WASI_ERRNO_INVAL;
+  // can be neither honoured nor reported back accurately.
+  if (size > MAX_FILE_SIZE) return WASIAbi.WASI_ERRNO_FBIG;
   if (size === node.content.byteLength) return WASIAbi.WASI_ESUCCESS;
 
   try {

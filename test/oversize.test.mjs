@@ -95,6 +95,48 @@ describe("fd.useMemoryFS oversize requests", () => {
     );
   });
 
+  it("reports EINVAL for a size that is not a count of bytes", () => {
+    // A guest cannot produce these: every size it supplies arrives as a
+    // `bigint` and converts to a whole number. A host driving the imports
+    // directly can. Whatever the magnitude, a malformed size is a bad
+    // argument, not a large file.
+    const h = makeFS();
+    const fd = openFile(h, "malformed");
+    for (const size of [NaN, 1.5, Infinity, -Infinity]) {
+      assert.strictEqual(
+        h.imports.fd_filestat_set_size(fd, size),
+        EINVAL,
+        `size ${size} should be EINVAL, not EFBIG`,
+      );
+    }
+  });
+
+  it("leaves the file cursor where it was when it refuses", () => {
+    const h = makeFS();
+    const fd = openFile(h, "cursor");
+    writeOneByte(h);
+    assert.strictEqual(
+      h.imports.fd_write(fd, IOVEC_PTR, 1, OUT_PTR + 8),
+      ESUCCESS,
+    );
+
+    assert.strictEqual(
+      h.imports.fd_seek(fd, UNREPRESENTABLE, 0, OUT_PTR + 8),
+      ESUCCESS,
+    );
+    assert.strictEqual(h.imports.fd_tell(fd, OUT_PTR + 16), ESUCCESS);
+    const before = h.view.getBigUint64(OUT_PTR + 16, true);
+
+    assert.strictEqual(
+      h.imports.fd_write(fd, IOVEC_PTR, 1, OUT_PTR + 8),
+      EFBIG,
+    );
+
+    assert.strictEqual(h.imports.fd_tell(fd, OUT_PTR + 16), ESUCCESS);
+    assert.strictEqual(h.view.getBigUint64(OUT_PTR + 16, true), before);
+    assert.strictEqual(h.fs.lookup("/cursor").content.byteLength, 1);
+  });
+
   it("reports EINVAL for a negative size", () => {
     // A guest cannot reach this, because `filesize` is unsigned. A host that
     // drives the imports directly can.
