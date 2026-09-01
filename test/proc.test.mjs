@@ -5,7 +5,7 @@ import assert from "node:assert";
 
 function makeImports() {
   const abi = new WASIAbi();
-  return useProc({}, abi, () => {
+  return useProc()({}, abi, () => {
     throw new Error("memory should not be touched");
   });
 }

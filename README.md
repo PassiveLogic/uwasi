@@ -68,7 +68,7 @@ import { WASI, useArgs, useClock } from "uwasi";
 
 const wasi = new WASI({
     args: ["./a.out", "hello", "world"],
-    features: [useEnviron, useArgs, useClock, useProc, useRandom()],
+    features: [useEnviron(), useArgs(), useClock(), useProc(), useRandom()],
 });
 ```
 

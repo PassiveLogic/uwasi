@@ -16,11 +16,11 @@ export function useAll(useOptions: Options = {}): WASIFeatureProvider {
   return (options: WASIOptions, abi: WASIAbi, memoryView: () => DataView) => {
     const features = [
       useMemoryFS(useOptions),
-      useEnviron,
-      useArgs,
-      useClock,
+      useEnviron(),
+      useArgs(),
+      useClock(),
       usePoll(useOptions),
-      useProc,
+      useProc(),
       useRandom(useOptions),
     ];
     return features.reduce((acc, fn) => {
