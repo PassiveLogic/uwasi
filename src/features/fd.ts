@@ -732,11 +732,33 @@ function statOf(node: FSNode): {
   };
 }
 
-/** Resize a file's backing buffer, zero-filling any growth. */
-function resizeFile(node: FileNode, size: number): void {
-  if (size === node.content.byteLength) return;
-  node.content = resizeContent(node.content, size);
+/**
+ * Resize a file's backing buffer, zero-filling any growth. Returns an errno.
+ *
+ * A guest chooses this size, so it can ask for one no JavaScript engine will
+ * allocate. Both failures return an errno rather than throw: an exception
+ * raised inside an import unwinds through the guest and traps the module,
+ * which leaves the guest no way to see the error or recover from it.
+ */
+function resizeFile(node: FileNode, size: number): number {
+  // Above 2^53 a size no longer survives the trip through a JS number, so it
+  // cannot be honoured or reported back accurately.
+  if (!Number.isSafeInteger(size)) {
+    return size < 0 ? WASIAbi.WASI_ERRNO_INVAL : WASIAbi.WASI_ERRNO_FBIG;
+  }
+  if (size < 0) return WASIAbi.WASI_ERRNO_INVAL;
+  if (size === node.content.byteLength) return WASIAbi.WASI_ESUCCESS;
+
+  try {
+    node.content = resizeContent(node.content, size);
+  } catch (error) {
+    // The engine refused the allocation. For a filesystem held in memory,
+    // that is the same condition as a full disk.
+    if (error instanceof RangeError) return WASIAbi.WASI_ERRNO_NOSPC;
+    throw error;
+  }
   node.mtim = nowNs();
+  return WASIAbi.WASI_ESUCCESS;
 }
 
 /** Whether `buffer` can be resized after the fact. Typed here to avoid a newer lib. */
@@ -960,7 +982,10 @@ export function useMemoryFS(
         if (file.node.type === "dir") return WASIAbi.WASI_ERRNO_ISDIR;
         if (file.node.type !== "file") return WASIAbi.WASI_ERRNO_NOTSUP;
         const end = Number(offset) + Number(len);
-        if (end > file.node.content.byteLength) resizeFile(file.node, end);
+        if (end > file.node.content.byteLength) {
+          const errno = resizeFile(file.node, end);
+          if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
+        }
         return WASIAbi.WASI_ESUCCESS;
       },
 
@@ -1027,7 +1052,8 @@ export function useMemoryFS(
         const file = getFile(fd);
         if (!file) return WASIAbi.WASI_ERRNO_BADF;
         if (file.node.type !== "file") return WASIAbi.WASI_ERRNO_INVAL;
-        resizeFile(file.node, Number(size));
+        const errno = resizeFile(file.node, Number(size));
+        if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
         return WASIAbi.WASI_ESUCCESS;
       },
 
@@ -1097,7 +1123,8 @@ export function useMemoryFS(
         let position = Number(offset);
         const total = iovViews.reduce((acc, b) => acc + b.byteLength, 0);
         if (position + total > file.node.content.byteLength) {
-          resizeFile(file.node, position + total);
+          const errno = resizeFile(file.node, position + total);
+          if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
         }
         for (const buf of iovViews) {
           file.node.content.set(buf, position);
@@ -1281,7 +1308,8 @@ export function useMemoryFS(
             : file.position;
         const total = iovViews.reduce((acc, b) => acc + b.byteLength, 0);
         if (position + total > file.node.content.byteLength) {
-          resizeFile(file.node, position + total);
+          const errno = resizeFile(file.node, position + total);
+          if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
         }
         for (const buf of iovViews) {
           file.node.content.set(buf, position);
@@ -1440,7 +1468,8 @@ export function useMemoryFS(
             if ((dir.rightsBase & RIGHTS.PATH_FILESTAT_SET_SIZE) === BIG_ZERO) {
               return WASIAbi.WASI_ERRNO_NOTCAPABLE;
             }
-            resizeFile(node, 0);
+            const errno = resizeFile(node, 0);
+            if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
           }
         } else {
           if ((oflags & WASIAbi.WASI_OFLAGS_CREAT) === 0) {
