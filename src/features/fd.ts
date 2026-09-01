@@ -319,6 +319,16 @@ function makeDir(): DirectoryNode {
   return stampMeta({ type: "dir" as const, entries: {} });
 }
 function makeFile(content: Uint8Array): FileNode {
+  // Web IDL rejects views over a resizable buffer wherever it expects a
+  // `BufferSource`, so those contents could never be handed back out. Copy once.
+  if (isResizable(content.buffer)) {
+    content = new Uint8Array(content);
+  }
+  // `lookup` returns the live view, so a caller can build a second file on a
+  // buffer the first one owns. Disown it instead of copying: whoever grows
+  // first then takes a fresh buffer, and neither can write over the other's
+  // bytes by reusing spare room or zeroing after a shrink.
+  ownBuffers.delete(content.buffer);
   return stampMeta({ type: "file" as const, content, nlink: 1 });
 }
 function makeSymlink(target: string): SymlinkNode {
@@ -725,14 +735,70 @@ function statOf(node: FSNode): {
 /** Resize a file's backing buffer, zero-filling any growth. */
 function resizeFile(node: FileNode, size: number): void {
   if (size === node.content.byteLength) return;
-  const next = new Uint8Array(size);
-  next.set(
-    size < node.content.byteLength
-      ? node.content.subarray(0, size)
-      : node.content,
-  );
-  node.content = next;
+  node.content = resizeContent(node.content, size);
   node.mtim = nowNs();
+}
+
+/** Whether `buffer` can be resized after the fact. Typed here to avoid a newer lib. */
+function isResizable(buffer: ArrayBufferLike): boolean {
+  return (buffer as { resizable?: boolean }).resizable === true;
+}
+
+/** Buffers allocated here, whose spare room is safe to grow into. */
+const ownBuffers = new WeakSet<ArrayBufferLike>();
+
+/** Spare room after `data` in a buffer this module owns, or 0. */
+function ownCapacity(data: Uint8Array): number {
+  if (!ownBuffers.has(data.buffer) || data.byteOffset !== 0) return 0;
+  return data.buffer.byteLength;
+}
+
+/**
+ * Return a `Uint8Array` of `newSize` bytes holding as much of `data` as fits.
+ *
+ * Files are stored in a buffer with room to spare, and the view describes only
+ * the part in use. An append then re-views the same buffer instead of copying
+ * the file, so N bytes of small writes cost O(N) rather than O(N^2).
+ *
+ * Solves the problem reported in #12, which Cheng Shao also fixed for
+ * bjorn3/browser_wasi_shim in #95. That fix reserves the spare room with a
+ * resizable `ArrayBuffer`; this one uses a plain oversized buffer, because Web
+ * IDL rejects a view backed by a resizable buffer wherever it expects a
+ * `BufferSource` (https://webidl.spec.whatwg.org/#AllowResizable). A plain
+ * buffer needs no such guard, so nothing has to be copied before an embedder
+ * reads it.
+ */
+function resizeContent(data: Uint8Array, newSize: number): Uint8Array {
+  if (data.byteLength === newSize) return data;
+
+  const capacity = ownCapacity(data);
+
+  // Growing into spare room. Zero what a previous shrink may have left there.
+  // Past roughly a doubling a fresh buffer is cheaper: its pages arrive zeroed.
+  if (
+    newSize > data.byteLength &&
+    newSize <= capacity &&
+    newSize - data.byteLength <= data.byteLength
+  ) {
+    const grown = new Uint8Array(data.buffer, 0, newSize);
+    grown.fill(0, data.byteLength);
+    return grown;
+  }
+
+  // Shrinking. Re-view in place, unless most of the buffer would go to waste.
+  if (newSize < data.byteLength && capacity !== 0 && newSize * 4 >= capacity) {
+    return new Uint8Array(data.buffer, 0, newSize);
+  }
+
+  const buffer = new ArrayBuffer(
+    newSize < data.byteLength
+      ? newSize
+      : Math.max(newSize, data.byteLength * 2),
+  );
+  ownBuffers.add(buffer);
+  const next = new Uint8Array(buffer, 0, newSize);
+  next.set(newSize < data.byteLength ? data.subarray(0, newSize) : data);
+  return next;
 }
 
 /** fstflags validation shared by fd/path filestat_set_times. */
