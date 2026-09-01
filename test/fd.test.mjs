@@ -59,7 +59,7 @@ function makeFS(fileSystem = new MemoryFileSystem({ "/": "/" })) {
   return { fs: fileSystem, imports, view, bytes };
 }
 
-/** Keep the node itself: `lookup` compacts on the way out, hiding what is under test. */
+/** Keep the node itself, so growth tests see the buffer as the filesystem holds it. */
 function trackFile(h, name) {
   return h.fs.createFile(`/${name}`, new Uint8Array(0));
 }
@@ -235,10 +235,7 @@ describe("fd.useMemoryFS growth", () => {
   });
 
   it("grows a file whose view has an explicit length", () => {
-    // An explicit-length view and a length-tracking one look identical at rest.
-    // They differ after `resize`: the explicit-length view keeps its old length
-    // and stops describing its buffer. Resizing it in place would leave the
-    // file reporting a stale size, and the next write would land out of bounds.
+    // Explicit-length views are copied in, not adopted.
     const fs = new MemoryFileSystem({ "/": "/" });
     const buffer = new ArrayBuffer(4, { maxByteLength: 8 });
     const view = new Uint8Array(buffer, 0, 4);
@@ -254,8 +251,7 @@ describe("fd.useMemoryFS growth", () => {
   });
 
   it("grows correctly from a file whose view has a byte offset", () => {
-    // An offset view does not track `resize`, so growth must copy it.
-    // bjorn3/browser_wasi_shim#95 reads from buffer offset 0 and gets this wrong.
+    // Offset views cannot use reserved capacity.
     const fs = new MemoryFileSystem({ "/": "/" });
     const backing = new Uint8Array(64).fill(1);
     const node = fs.createFile("/offset", new Uint8Array(backing.buffer, 8, 4));
@@ -273,7 +269,6 @@ describe("fd.useMemoryFS growth", () => {
 });
 
 describe("fd.useMemoryFS read-boundary compaction", () => {
-  // Web IDL rejects resizable-backed views: https://webidl.spec.whatwg.org/#AllowResizable
   it("lookup returns contents on a plain buffer, without copying", () => {
     const h = makeFS();
     const node = trackFile(h, "log");
@@ -285,7 +280,6 @@ describe("fd.useMemoryFS read-boundary compaction", () => {
     assert.strictEqual(isResizable(seen.content.buffer), false);
     assert.strictEqual(seen.content.byteLength, 2048);
     assert.ok(seen.content.every((b) => b === 71));
-    // Nothing is copied on the way out: reading is free.
     assert.strictEqual(seen.content, node.content);
   });
 
@@ -318,9 +312,6 @@ describe("fd.useMemoryFS read-boundary compaction", () => {
   });
 
   it("copies a caller-supplied resizable buffer", () => {
-    // The guarantee is about the backing buffer, not about buffers this module
-    // allocated. A caller can hand `createFile` a view over its own resizable
-    // buffer, and Web IDL rejects that just the same.
     const fs = new MemoryFileSystem({ "/": "/" });
     const buffer = new ArrayBuffer(8, { maxByteLength: 16 });
     new Uint8Array(buffer).set([0, 1, 2, 3, 4, 5, 6, 7]);
@@ -329,6 +320,29 @@ describe("fd.useMemoryFS read-boundary compaction", () => {
     const seen = fs.lookup("/supplied");
     assert.strictEqual(isResizable(seen.content.buffer), false);
     assert.deepStrictEqual(Array.from(seen.content), [1, 2, 3]);
+  });
+
+  it("does not let one file grow into another file's buffer", () => {
+    // `lookup` hands back the live view, which a caller can pass straight to
+    // `createFile`. The two files must not then share spare room: growth or a
+    // shrink-then-grow in one would rewrite the other.
+    const h = makeFS();
+    const fd = openFile(h, "a");
+    write(h, fd, 512, 65);
+    write(h, fd, 512, 65);
+    write(h, fd, 512, 65);
+
+    h.fs.createFile("/b", h.fs.lookup("/a").content);
+    const b = h.fs.lookup("/b");
+    assert.strictEqual(b.content.byteLength, 1536);
+
+    h.imports.fd_filestat_set_size(fd, 1400n);
+    h.imports.fd_filestat_set_size(fd, 1500n);
+
+    assert.ok(
+      b.content.every((byte) => byte === 65),
+      "/b must be untouched by /a's resize",
+    );
   });
 
   it("does not stop the guest appending after a read", () => {
@@ -345,7 +359,6 @@ describe("fd.useMemoryFS read-boundary compaction", () => {
   });
 
   it("open/append/close does not reallocate on every cycle", () => {
-    // Compaction on close would copy per close and discard the capacity.
     const h = makeFS();
     const node = trackFile(h, "log");
 

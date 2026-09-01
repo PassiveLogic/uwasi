@@ -319,12 +319,16 @@ function makeDir(): DirectoryNode {
   return stampMeta({ type: "dir" as const, entries: {} });
 }
 function makeFile(content: Uint8Array): FileNode {
-  // A caller can supply a view over its own resizable buffer. Web IDL rejects
-  // those wherever it expects a `BufferSource`, so anything handed back out
-  // later would be unusable. Normalize once, here, rather than on every read.
+  // Web IDL rejects views over a resizable buffer wherever it expects a
+  // `BufferSource`, so those contents could never be handed back out. Copy once.
   if (isResizable(content.buffer)) {
     content = new Uint8Array(content);
   }
+  // `lookup` returns the live view, so a caller can build a second file on a
+  // buffer the first one owns. Disown it instead of copying: whoever grows
+  // first then takes a fresh buffer, and neither can write over the other's
+  // bytes by reusing spare room or zeroing after a shrink.
+  ownBuffers.delete(content.buffer);
   return stampMeta({ type: "file" as const, content, nlink: 1 });
 }
 function makeSymlink(target: string): SymlinkNode {
@@ -735,12 +739,7 @@ function resizeFile(node: FileNode, size: number): void {
   node.mtim = nowNs();
 }
 
-/**
- * Whether `buffer` can be resized after the fact.
- *
- * Typed here rather than through `lib.es2024.arraybuffer`, so the build keeps
- * working on the TypeScript version this project already pins.
- */
+/** Whether `buffer` can be resized after the fact. Typed here to avoid a newer lib. */
 function isResizable(buffer: ArrayBufferLike): boolean {
   return (buffer as { resizable?: boolean }).resizable === true;
 }
@@ -774,9 +773,8 @@ function resizeContent(data: Uint8Array, newSize: number): Uint8Array {
 
   const capacity = ownCapacity(data);
 
-  // Growing into spare room. Zero what is newly exposed: a previous shrink may
-  // have left bytes there. Skip it when the gap is larger than the file, where
-  // a fresh buffer is cheaper - the operating system supplies zeroed pages.
+  // Growing into spare room. Zero what a previous shrink may have left there.
+  // Past roughly a doubling a fresh buffer is cheaper: its pages arrive zeroed.
   if (
     newSize > data.byteLength &&
     newSize <= capacity &&
