@@ -18,6 +18,12 @@ export { SharedInputChannel } from "./input_channel.js";
 export * from "./features/random.js";
 export * from "./features/tracing.js";
 
+/** Whether `value` would contribute nothing to the import object. */
+function isEmpty(value: object): boolean {
+  for (const _ in value) return false;
+  return true;
+}
+
 export class WASI {
   /**
    * `wasiImport` is an object that implements the WASI system call API. This object
@@ -36,6 +42,23 @@ export class WASI {
       for (const useFeature of options.features) {
         const featureName = useFeature.name || "Unknown feature";
         const imports = useFeature(options, abi, this.view.bind(this));
+        // Every feature is a factory, so a provider is what a call to one
+        // returns. Getting a function back means the call is missing, and none
+        // of that feature's syscalls would be registered.
+        //
+        // A function can still carry imports as enumerable properties, and one
+        // that does is a usable import map, so the test is whether anything
+        // would be registered rather than the type alone.
+        if (typeof imports === "function" && isEmpty(imports)) {
+          const name = useFeature.name;
+          throw new TypeError(
+            name
+              ? `uwasi: \`${name}\` was passed to the features array without ` +
+                `being called. Write \`${name}(...)\`.`
+              : "uwasi: a feature was passed to the features array without " +
+                "being called. Call it, and pass the result.",
+          );
+        }
         for (const key in imports) {
           importProviders[key] = featureName;
         }

@@ -12,7 +12,7 @@ function makeImports() {
   const memory = new ArrayBuffer(1024);
   const view = new DataView(memory);
   const abi = new WASIAbi();
-  const imports = useClock({}, abi, () => view);
+  const imports = useClock()({}, abi, () => view);
   return { view, imports };
 }
 
