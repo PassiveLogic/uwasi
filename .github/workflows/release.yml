@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm OIDC trusted publishing
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.14.0
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing requires npm 11.5.1 or later
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+      - run: npm test
+      - run: npm publish
