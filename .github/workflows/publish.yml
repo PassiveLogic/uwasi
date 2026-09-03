@@ -1,8 +1,12 @@
 on:
   release:
     types: [published]
-  # Packaging changes are the ones that can break a release, so the pack step
-  # below runs on a pull request that touches them.
+  # main should always be in a publishable state, so the pack runs on every
+  # merge. A release that fails here fails weeks after the change that broke it.
+  push:
+    branches:
+      - main
+  # On a pull request, only the files that decide what a release contains.
   pull_request:
     branches:
       - main
@@ -10,6 +14,9 @@ on:
       - .github/workflows/publish.yml
       - package.json
       - package-lock.json
+      - tsconfig.base.json
+      - tsconfig.cjs.json
+      - tsconfig.esm.json
       # npm reads .gitignore to decide what goes in the tarball.
       - .gitignore
   workflow_dispatch:
@@ -33,9 +40,16 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       # `npm ci` rather than test.yml's `npm install`, so a release builds from
-      # the locked dependency tree. `prepare` compiles lib/ as a side effect.
+      # the locked dependency tree. `prepare` compiles lib/ as a side effect,
+      # which makes this step the build as well as the install.
       - run: npm ci
-      - run: npm test
+
+      # test.yml already covers push and pull_request. A release must not trust
+      # an earlier run: CI has been silent for weeks at a time in this
+      # repository, so the tests run again here before anything is published.
+      - name: Run the tests
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        run: npm test
 
       # A tag that disagrees with package.json publishes the wrong version
       # under the right name, and npm does not allow a second attempt at a
@@ -51,8 +65,9 @@ jobs:
           fi
 
       # Everything the publish does, except the upload. This is what runs on a
-      # pull request, on a manual run, and on a release cut in a fork — only
-      # this repository owns the `uwasi` name on npm. It needs no secret.
+      # merge to main, on a pull request, on a manual run, and on a release cut
+      # in a fork — only this repository owns the `uwasi` name on npm. It needs
+      # no secret.
       - name: Pack without publishing
         if: github.event_name != 'release' || github.repository != 'swiftwasm/uwasi'
         run: npm publish --dry-run
