@@ -260,3 +260,18 @@ Host-side APIs beyond the preview1 surface (`usePoll`'s `sleep`/
 invisible to guests. They intentionally mirror preview2 shapes — a
 `WASIFdReadiness` is a `pollable`, a `SharedInputChannel` is an
 `input-stream` producer — so a future preview2 host layer can reuse them.
+
+## Releasing
+
+Publish a GitHub release with a stable version tag such as `1.5.2` or `v1.5.2`.
+The Release workflow checks out that tag and sets the npm package version from it
+before building, testing, and publishing. No separate manifest version bump is
+required; the workflow updates `package.json` and `package-lock.json` only in its
+checkout, without creating commits or tags. Prerelease tags are not supported by
+this workflow, which publishes to npm's `latest` tag.
+
+To retry a failed publication, run the Release workflow manually from `main` and
+enter the existing release tag in the `tag` input. This uses the workflow on
+`main` while publishing the source at the selected tag. Rerunning an old failed
+job does not pick up workflow fixes. Only retry versions that have not already
+been published to npm.

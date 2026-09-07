@@ -4,11 +4,18 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish (e.g. 1.5.2)
+        required: true
+        type: string
 
 jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
     permissions:
       contents: read
       # Required for npm OIDC trusted publishing
@@ -16,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           submodules: true
 
       - uses: actions/setup-node@v7
@@ -23,6 +31,15 @@ jobs:
           # Node 24 ships npm 11.x, required for trusted publishing (npm >= 11.5.1)
           node-version: 24.20.0
           registry-url: https://registry.npmjs.org
+
+      - name: Set release version
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'Expected a stable release tag such as 1.5.2 or v1.5.2, got: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - run: npm ci
       - run: npm test
