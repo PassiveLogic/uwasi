@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to publish (e.g. 1.5.2)
+        description: Existing release tag to publish (e.g. 1.5.0)
         required: true
         type: string
 
@@ -36,7 +36,7 @@ jobs:
         run: |
           VERSION="${RELEASE_TAG#v}"
           if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            printf 'Expected a stable release tag such as 1.5.2 or v1.5.2, got: %s\n' "$RELEASE_TAG" >&2
+            printf 'Expected a stable release tag such as 1.5.0 or v1.5.0, got: %s\n' "$RELEASE_TAG" >&2
             exit 1
           fi
           npm version "$VERSION" --no-git-tag-version --allow-same-version
