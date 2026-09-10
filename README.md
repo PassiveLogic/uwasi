@@ -175,6 +175,17 @@ isolated (`Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` response headers). Node.js and
 worker threads need no special setup.
 
+### Custom storage backends
+
+`uwasi/filesystem` exposes the synchronous `FSBackend` contract, namespace
+types, storage errno constants, and `useFileSystem` provider. It keeps WASI
+path resolution, descriptors, rights checks, and guest-memory handling out
+of storage backends. Existing root exports are unchanged, and `useAll()`
+continues to select memory storage.
+
+See [Filesystem Backends](docs/filesystem-backends.md) for the public
+boundary, source layout, external consumer test, and unchanged storage limits.
+
 ## Implementation Status
 
 43 of the 46 WASI preview1 functions are implemented (the three
