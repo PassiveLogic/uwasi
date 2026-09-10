@@ -8,6 +8,7 @@ import {
   MemoryFileSystem,
   useFileSystem,
 } from "uwasi/filesystem";
+import { OPFSBackend, useOPFS } from "uwasi/opfs";
 
 export class ExternalBackend implements FSBackend {
   bytes = new Map<FileNode, Uint8Array>();
@@ -86,4 +87,8 @@ export function createConsumer() {
     ],
   });
   return { backend, fileSystem, wasi };
+}
+
+export function opfsProvider(backend: OPFSBackend) {
+  return new WASI({ features: [useOPFS({ withBackend: backend })] });
 }

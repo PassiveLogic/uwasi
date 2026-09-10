@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WASI } from "uwasi";
 import * as filesystem from "uwasi/filesystem";
+import { OPFSBackend } from "uwasi/opfs";
 import { MemoryFSBackend } from "../lib/esm/memory/backend.js";
+import { WASIAbi } from "../lib/esm/abi.js";
+import { MockOPFS } from "./opfs_mock.mjs";
 
 const { MemoryFileSystem, FSErrno, useFileSystem } = filesystem;
 const RIGHTS = (1n << 30n) - 1n;
@@ -124,6 +127,108 @@ for (const alias of ["source", "alias"]) {
   });
 }
 
+async function opfsFixture(t, hooks = {}, spareFiles = 1) {
+  const store = new MockOPFS();
+  const root = store.root;
+  const getFileHandle = root.getFileHandle.bind(root);
+  root.getFileHandle = async (name, options) => {
+    const file = await getFileHandle(name, options);
+    if (!name.startsWith(".uwasi.data.")) return file;
+    const acquire = file.createSyncAccessHandle.bind(file);
+    file.createSyncAccessHandle = async () => {
+      await hooks.acquire?.(name);
+      const handle = await acquire();
+      for (const method of ["read", "getSize"]) {
+        const original = handle[method].bind(handle);
+        handle[method] = (...args) => {
+          hooks[method]?.();
+          return original(...args);
+        };
+      }
+      return handle;
+    };
+    return file;
+  };
+  const backend = await OPFSBackend.create(root, { spareFiles });
+  t.after(() => backend.close());
+  const g = guest(backend);
+  return { backend, g, store };
+}
+
+for (const syscall of ["fd_read", "fd_pread"]) {
+  for (const failingRead of [1, 2]) {
+    test(`${syscall} physical failure at iovec ${failingRead} returns IO without committing output or cursor`, async (t) => {
+      const hooks = {};
+      const { backend, g } = await opfsFixture(t, hooks);
+      const fd = g.open("file", WASIAbi.WASI_OFLAGS_CREAT);
+      assert.equal(
+        backend.writeAt(
+          backend.fileSystem.lookup("/file"),
+          new Uint8Array([10, 20, 30, 40]),
+          0,
+        ),
+        FSErrno.SUCCESS,
+      );
+      g.iovecs();
+      let reads = 0;
+      hooks.read = () => {
+        if (++reads === failingRead)
+          throw new DOMException("read failed", "UnknownError");
+      };
+      const args = syscall === "fd_pread" ? [0n, OUTPUT] : [OUTPUT];
+      assert.equal(g.calls[syscall](fd, IOVS, 2, ...args), FSErrno.IO);
+      assert.equal(g.view.getUint32(OUTPUT, true), SENTINEL);
+      assert.equal(g.cursor(fd), 0n);
+      assert.deepEqual(
+        [...g.bytes.slice(DATA, DATA + 4)],
+        failingRead === 1 ? [99, 99, 99, 99] : [10, 20, 99, 99],
+      );
+      hooks.read = undefined;
+      assert.equal(g.calls[syscall](fd, IOVS, 2, ...args), FSErrno.SUCCESS);
+      assert.equal(g.view.getUint32(OUTPUT, true), 4);
+      assert.equal(g.cursor(fd), syscall === "fd_read" ? 4n : 0n);
+      assert.equal(g.calls.fd_pread(fd, IOVS, 2, 4n, OUTPUT), FSErrno.SUCCESS);
+      assert.equal(g.view.getUint32(OUTPUT, true), 0);
+    });
+  }
+}
+
+const sizeCalls = {
+  fd_filestat_get: (g, fd) => g.calls.fd_filestat_get(fd, STAT),
+  path_filestat_get: (g) =>
+    g.calls.path_filestat_get(3, 0, ...g.path("file"), STAT),
+  fd_seek: (g, fd) => g.calls.fd_seek(fd, 0n, WASIAbi.WASI_WHENCE_END, OUTPUT),
+  fd_allocate: (g, fd) => g.calls.fd_allocate(fd, 0n, 8n),
+  fd_write: (g, fd) => g.calls.fd_write(fd, IOVS, 2, OUTPUT),
+  fd_pwrite: (g, fd) => g.calls.fd_pwrite(fd, IOVS, 2, 0n, OUTPUT),
+  fd_write_append: (g, fd) => {
+    assert.equal(
+      g.calls.fd_fdstat_set_flags(fd, WASIAbi.WASI_FDFLAGS_APPEND),
+      FSErrno.SUCCESS,
+    );
+    return g.calls.fd_write(fd, IOVS, 2, OUTPUT);
+  },
+};
+
+for (const [name, invoke] of Object.entries(sizeCalls)) {
+  test(`${name} physical getSize failure returns IO without changing outputs or cursor`, async (t) => {
+    const hooks = {};
+    const { backend, g } = await opfsFixture(t, hooks);
+    const fd = g.open("file", WASIAbi.WASI_OFLAGS_CREAT);
+    g.iovecs();
+    g.bytes.fill(99, STAT, STAT + 64);
+    hooks.getSize = () => {
+      throw new DOMException("size failed", "UnknownError");
+    };
+    assert.equal(invoke(g, fd), FSErrno.IO);
+    assert.equal(g.view.getUint32(OUTPUT, true), SENTINEL);
+    assert.deepEqual([...g.bytes.slice(STAT, STAT + 64)], Array(64).fill(99));
+    assert.equal(g.cursor(fd), 0n);
+    hooks.getSize = undefined;
+    assert.equal(backend.fileSize(backend.fileSystem.lookup("/file")), 0);
+  });
+}
+
 test("public FSError preserves numeric backend APIs and maps only explicit backend errors", () => {
   assert.equal(typeof filesystem.FSError, "function");
   const fs = new MemoryFileSystem();
@@ -152,4 +257,106 @@ test("public FSError preserves numeric backend APIs and maps only explicit backe
     () => g.calls.fd_filestat_get(fd, STAT),
     (error) => error === unexpected,
   );
+});
+
+test("OPFS numeric methods throw public FSError with the physical errno mapping", async (t) => {
+  const hooks = {};
+  const { backend, g } = await opfsFixture(t, hooks);
+  g.open("file", WASIAbi.WASI_OFLAGS_CREAT);
+  const node = backend.fileSystem.lookup("/file");
+  for (const [method, invoke] of [
+    ["read", () => backend.readAt(node, new Uint8Array(1), 0)],
+    ["getSize", () => backend.fileSize(node)],
+  ]) {
+    for (const [error, errno] of [
+      [new DOMException("IO", "UnknownError"), FSErrno.IO],
+      [new DOMException("quota", "QuotaExceededError"), FSErrno.NOSPC],
+      [new RangeError("capacity"), FSErrno.NOSPC],
+    ]) {
+      hooks[method] = () => {
+        throw error;
+      };
+      assert.throws(
+        invoke,
+        (caught) =>
+          typeof filesystem.FSError === "function" &&
+          caught instanceof filesystem.FSError &&
+          caught.errno === errno,
+      );
+    }
+    const unexpected = new TypeError("programming error");
+    hooks[method] = () => {
+      throw unexpected;
+    };
+    assert.throws(invoke, (caught) => caught === unexpected);
+    hooks[method] = undefined;
+    assert.equal(invoke(), 0);
+  }
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("close racing a net-new pending file does not reacquire its recycled id", async (t) => {
+  const entered = deferred();
+  const release = deferred();
+  const acquisitions = [];
+  const { backend, g, store } = await opfsFixture(
+    t,
+    {
+      acquire: async (name) => {
+        acquisitions.push(name);
+        entered.resolve();
+        await release.promise;
+      },
+    },
+    0,
+  );
+  const closing = backend.close();
+  g.open("late", WASIAbi.WASI_OFLAGS_CREAT);
+  await entered.promise;
+  release.resolve();
+  await closing;
+  assert.equal(acquisitions.length, 1);
+  assert.equal(store._openHandles.size, 0);
+});
+
+test("cancelled materialization preserves a newer pending id for the same node", async (t) => {
+  const entered = deferred();
+  const release = deferred();
+  const acquisitions = [];
+  const { backend, g } = await opfsFixture(
+    t,
+    {
+      acquire: async (name) => {
+        acquisitions.push(name);
+        if (acquisitions.length === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+      },
+    },
+    0,
+  );
+  g.open("file", WASIAbi.WASI_OFLAGS_CREAT);
+  const node = backend.fileSystem.lookup("/file");
+  await entered.promise;
+  const root = backend.fileSystem.lookup("/");
+  assert.equal(backend.removeChild(root, "file"), FSErrno.SUCCESS);
+  backend.fileSystem.setNode("/file", node);
+  assert.equal(backend.openFile(node), FSErrno.SUCCESS);
+  assert.equal(backend.writeAt(node, new Uint8Array([42]), 0), FSErrno.SUCCESS);
+  release.resolve();
+  await backend.settle();
+  assert.equal(acquisitions.length, 2);
+  assert.notEqual(acquisitions[0], acquisitions[1]);
+  assert.equal(backend.sync(node), FSErrno.SUCCESS);
+  const bytes = new Uint8Array(1);
+  assert.equal(backend.readAt(node, bytes, 0), 1);
+  assert.equal(bytes[0], 42);
 });
