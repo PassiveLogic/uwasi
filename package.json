@@ -1,6 +1,6 @@
 {
   "name": "uwasi",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "Micro modularized WASI runtime for JavaScript",
   "main": "./lib/cjs/index.js",
   "types": "./lib/cjs/index.d.ts",
@@ -8,6 +8,20 @@
     ".": {
       "import": "./lib/esm/index.js",
       "require": "./lib/cjs/index.js"
+    },
+    "./filesystem": {
+      "import": "./lib/esm/filesystem/index.js",
+      "require": "./lib/cjs/filesystem/index.js"
+    },
+    "./opfs": {
+      "import": "./lib/esm/opfs/index.js",
+      "require": "./lib/cjs/opfs/index.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "filesystem": ["lib/cjs/filesystem/index.d.ts"],
+      "opfs": ["lib/cjs/opfs/index.d.ts"]
     }
   },
   "scripts": {
