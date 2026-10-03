@@ -497,6 +497,37 @@ describe("OPFSBackend", () => {
     assert.strictEqual(sysReadText(w2.h, open2.fd).text, "from the embedder");
     await w2.backend.close();
   });
+
+  it("reopening an overdrafted file does not rewrite the namespace record", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    sysClose(w.h, sysCreate(w.h, "f0").fd);
+    const f1 = sysCreate(w.h, "f1");
+    assert.strictEqual(f1.errno, ESUCCESS);
+    assert.strictEqual(
+      sysSync(w.h, f1.fd),
+      WASIAbi.WASI_ERRNO_NOSPC,
+      "f1 must still be overdrafted for this test to mean anything",
+    );
+    sysClose(w.h, f1.fd);
+
+    const metaWrites = () =>
+      store.opLog.filter(
+        (e) => e.path.includes(".uwasi.meta.") && e.op === "flush",
+      ).length;
+    const before = metaWrites();
+    for (let i = 0; i < 3; i++) {
+      const reopened = sysOpen(w.h, "f1");
+      assert.strictEqual(reopened.errno, ESUCCESS);
+      sysClose(w.h, reopened.fd);
+    }
+    assert.strictEqual(
+      metaWrites(),
+      before,
+      "a read-only open changed nothing",
+    );
+    await w.backend.close();
+  });
 });
 
 /** Name of the root-level data file whose durable bytes contain `text`. */

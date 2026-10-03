@@ -198,7 +198,12 @@ export class OPFSBackend implements FSBackend {
    * the background materializer creates the physical file.
    */
   private pendingIds = new Map<FileNode, number>();
-  /** Nodes already part of the persisted namespace (hard-link detection). */
+  /**
+   * File nodes a durable namespace record names. A node joins only once a
+   * record naming it is flushed: an id alone proves nothing, since `adopt`
+   * hands one out before the record that would name it is written, and
+   * that write can fail. Hard-link detection and `openFile` rely on it.
+   */
   private known = new WeakSet<FileNode>();
   private openCounts = new Map<FileNode, number>();
   /** Unlinked-but-open files awaiting content destruction at last close. */
@@ -364,7 +369,8 @@ export class OPFSBackend implements FSBackend {
    */
   private snapshotFlush(): void {
     const root = this.fileSystem.lookup("/") as DirectoryNode;
-    const record = this.serializeDir(root);
+    const files: FileNode[] = [];
+    const record = this.serializeDir(root, files);
     const generation = this.generation + 1;
     const buffer = encodeMeta({
       gen: generation,
@@ -376,19 +382,21 @@ export class OPFSBackend implements FSBackend {
     handle.truncate(buffer.byteLength);
     handle.flush();
     this.generation = generation;
+    for (const file of files) this.known.add(file);
   }
 
-  private serializeDir(dir: DirectoryNode): MetaDir {
+  /** Serialize `dir`'s subtree, collecting the file nodes it names. */
+  private serializeDir(dir: DirectoryNode, files: FileNode[]): MetaDir {
     const d: { [name: string]: MetaEntry } = {};
     for (const name of Object.keys(dir.entries)) {
       const child = dir.entries[name];
       switch (child.type) {
         case "dir":
-          d[name] = this.serializeDir(child);
+          d[name] = this.serializeDir(child, files);
           break;
         case "file": {
           this.adopt(child);
-          this.known.add(child);
+          files.push(child);
           const id = this.physByNode.get(child) ?? this.pendingIds.get(child)!;
           d[name] = { f: id };
           break;
@@ -580,7 +588,6 @@ export class OPFSBackend implements FSBackend {
         handle.flush();
         this.handleById.set(id, handle);
         this.physByNode.set(child, id);
-        this.known.add(child);
         child.content = new Uint8Array(0);
       }
     }
@@ -728,11 +735,16 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   openFile(node: FileNode): number {
-    if (!this.physByNode.has(node)) {
-      // First open of a file the backend has not persisted yet: adopt it
-      // now so every later op runs over its sync access handle, and
-      // record it (path_open with CREAT already snapshotted, this covers
-      // tree-builder seeded files opened before any namespace change).
+    if (
+      !this.known.has(node) ||
+      (!this.physByNode.has(node) && !this.pendingIds.has(node))
+    ) {
+      // First open of a file the record does not name yet: adopt it now
+      // so every later op runs over its sync access handle, and record it
+      // (path_open with CREAT already snapshotted, this covers
+      // tree-builder seeded files opened before any namespace change, and
+      // retries after that snapshot failed). A recorded file needs no new
+      // record, even overdrafted: its id is already in it.
       try {
         this.adopt(node);
         this.snapshotFlush();
@@ -765,7 +777,9 @@ export class OPFSBackend implements FSBackend {
   createChild(parent: DirectoryNode, name: string, node: FSNode): number {
     if (
       node.type === "file" &&
-      (this.physByNode.has(node) || this.known.has(node))
+      (this.physByNode.has(node) ||
+        this.pendingIds.has(node) ||
+        this.known.has(node))
     ) {
       // A second name for an existing file is a hard link; the namespace
       // record maps ids to exactly one name (documented limitation).
