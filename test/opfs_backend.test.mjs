@@ -2,6 +2,7 @@ import { OPFSBackend, useOPFS } from "uwasi/opfs";
 import { WASIAbi } from "../lib/esm/abi.js";
 import { fsBackendContractSuite } from "./fs_backend_contract.mjs";
 import { MockOPFS } from "./opfs_mock.mjs";
+import { UWS1_STORE } from "./fixtures/opfs-store-uws1.mjs";
 import {
   bindImports,
   sysCreate,
@@ -717,6 +718,299 @@ describe("short and failed physical writes", () => {
     assert.strictEqual(reopened.errno, ESUCCESS);
     assert.strictEqual(sysReadText(w.h, reopened.fd).text, "precious");
     await w.backend.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Namespace record format and recovery.
+// ---------------------------------------------------------------------------
+
+/** Replace a root-level store file's durable bytes, as another worker could. */
+async function writeStoreFile(store, name, bytes) {
+  const file = await store.root.getFileHandle(name, { create: true });
+  const handle = await file.createSyncAccessHandle();
+  handle.truncate(0);
+  handle.write(bytes, { at: 0 });
+  handle.flush();
+  handle.close();
+}
+
+function fnv1a(bytes, hash = 0x811c9dc5) {
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+describe("namespace record format", () => {
+  it("a corrupt newest slot falls back to the older generation", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    putFile(w.h, "first", "1");
+    // The older slot keeps a full snapshot that records "first".
+    await w.backend.persistAll();
+    store.opLog.length = 0;
+    // Opening a seeded file records it with a full snapshot.
+    w.backend.fileSystem.addFile("/second", "2");
+    sysClose(w.h, sysOpen(w.h, "second").fd);
+    const newest = store.opLog
+      .filter((e) => /\.uwasi\.meta\.[01]$/.test(e.path) && e.op === "flush")
+      .pop()
+      .path.slice(1);
+    store.simulateCrash();
+
+    const slot = store.durableContent(newest);
+    slot[slot.byteLength - 1] ^= 0xff;
+    await writeStoreFile(store, newest, slot);
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(sysReadText(w2.h, sysOpen(w2.h, "first").fd).text, "1");
+    assert.strictEqual(
+      sysStat(w2.h, "second").errno,
+      WASIAbi.WASI_ERRNO_NOENT,
+      "the change recorded only in the corrupt slot is lost, nothing else",
+    );
+    await w2.backend.close();
+  });
+
+  /** Every store file's durable bytes, by name. */
+  function storeBytes(store) {
+    return new Map(
+      store.rootNames().map((name) => [name, store.durableContent(name)]),
+    );
+  }
+
+  /** A store whose files hold "A" (synced) and that was closed cleanly. */
+  async function closedStore() {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    putFile(w.h, "a", "A");
+    await w.backend.close();
+    return store;
+  }
+
+  /**
+   * Overwrite a slot with `body` under `magic`, checksum and all: over
+   * the first 8 header bytes and the body, as every later format must.
+   */
+  async function writeVerifiedSlot(store, name, magic, body) {
+    const slot = new Uint8Array(12 + body.byteLength);
+    const view = new DataView(slot.buffer);
+    slot.set(new TextEncoder().encode(magic), 0);
+    view.setUint32(4, body.byteLength, true);
+    view.setUint32(8, fnv1a(body, fnv1a(slot.subarray(0, 8))), true);
+    slot.set(body, 12);
+    await writeStoreFile(store, name, slot);
+  }
+
+  /** `bytes` with each `[offset, value]` patched in. */
+  function patched(bytes, ...patches) {
+    const copy = new Uint8Array(bytes);
+    for (const [at, value] of patches) copy[at] = value;
+    return copy;
+  }
+
+  /** Open `store` and expect "a" to read "A": the older slot was used. */
+  async function assertOlderSlotUsed(store, what) {
+    const fresh = await makeWorker(store);
+    assert.strictEqual(
+      sysReadText(fresh.h, sysOpen(fresh.h, "a").fd).text,
+      "A",
+      `${what}: the older slot is used`,
+    );
+    await fresh.backend.close();
+  }
+
+  /** A store whose two slots both name "a" (each open writes one). */
+  async function twoSlotStore() {
+    const store = new MockOPFS();
+    for (const name of ["a", "b", null]) {
+      const w = await makeWorker(store);
+      if (name !== null) putFile(w.h, name, name.toUpperCase());
+      await w.backend.close();
+    }
+    return store;
+  }
+
+  /** The newest slot: the one whose body (after the varint gen) is longer. */
+  function slotsByAge(store) {
+    const names = [".uwasi.meta.0", ".uwasi.meta.1"];
+    const gen = (name) => {
+      const bytes = store.durableContent(name);
+      return bytes.byteLength < 13 ? -1 : bytes[12];
+    };
+    return names.sort((a, b) => gen(b) - gen(a));
+  }
+
+  async function assertRefusedUntouched(store) {
+    const before = storeBytes(store);
+    await assert.rejects(
+      OPFSBackend.create(store.root),
+      /does not understand/,
+      "an unknown namespace format must not open as an empty store",
+    );
+    assert.deepStrictEqual(storeBytes(store), before, "the store was changed");
+  }
+
+  it("refuses to open a store whose snapshots are in an unknown format", async () => {
+    const store = await closedStore();
+    // A later format: same framing and a valid checksum, unknown magic.
+    for (const name of [".uwasi.meta.0", ".uwasi.meta.1"]) {
+      const slot = store.durableContent(name);
+      if (slot.byteLength < 12) continue;
+      await writeVerifiedSlot(store, name, "UWS3", slot.subarray(12));
+    }
+    await assertRefusedUntouched(store);
+  });
+
+  it("refuses an unknown newest slot even beside an older readable one", async () => {
+    // The unknown slot may hold the newest state, so falling back to the
+    // older one would silently roll the store back, and reclaim the data
+    // files of every file created since as unreferenced.
+    const store = await closedStore();
+    const [newest] = slotsByAge(store);
+    await writeVerifiedSlot(store, newest, "UWS9", new Uint8Array([1, 2, 3]));
+    await assertRefusedUntouched(store);
+  });
+
+  it("refuses a slot in this format that verifies but does not decode", async () => {
+    // The checksum covers the magic and length too, so no torn write can
+    // pass for an intact slot: this one is corrupt or of a later format
+    // that kept the magic, and may hold the newest namespace.
+    const store = await twoSlotStore();
+    const [newest] = slotsByAge(store);
+    await writeVerifiedSlot(store, newest, "UWS2", new Uint8Array([1, 9]));
+    await assertRefusedUntouched(store);
+  });
+
+  it("a slot whose length changed does not verify", async () => {
+    // A header torn over another slot's body: the checksum covers the
+    // header, so the slot is torn.
+    const store = await twoSlotStore();
+    const [newest] = slotsByAge(store);
+    const slot = store.durableContent(newest);
+    await writeStoreFile(store, newest, patched(slot, [4, 1]));
+    await assertOlderSlotUsed(store, "length");
+  });
+
+  it("refuses a slot whose magic is unknown, however its checksum fares", async () => {
+    // A write of a known magic, torn or not, leaves a known magic or
+    // zeros (see `decodeSnapshot`), so any other magic is not a tear.
+    const store = await twoSlotStore();
+    const [newest] = slotsByAge(store);
+    const slot = store.durableContent(newest);
+    await writeStoreFile(store, newest, patched(slot, [3, 0x33])); // "UWS3"
+    await assertRefusedUntouched(store);
+  });
+
+  /**
+   * A slot as earlier builds of this backend wrote it: "UWM1", length,
+   * FNV-1a of the body alone, then a JSON namespace.
+   */
+  function earlierSlot(payload) {
+    const body = new TextEncoder().encode(JSON.stringify(payload));
+    const slot = new Uint8Array(12 + body.byteLength);
+    const view = new DataView(slot.buffer);
+    slot.set(new TextEncoder().encode("UWM1"), 0);
+    view.setUint32(4, body.byteLength, true);
+    view.setUint32(8, fnv1a(body), true);
+    slot.set(body, 12);
+    return slot;
+  }
+
+  it("refuses a store an earlier build wrote, untouched", async () => {
+    // Its JSON namespace is not read, so opening the store as empty would
+    // reclaim the data files of every file it names.
+    for (const older of [null, { gen: 6, next: 1, root: { d: {} } }]) {
+      const store = new MockOPFS();
+      const encoder = new TextEncoder();
+      await writeStoreFile(store, ".uwasi.data.0", encoder.encode("A"));
+      await writeStoreFile(store, ".uwasi.data.1", encoder.encode("B"));
+      await writeStoreFile(
+        store,
+        ".uwasi.meta.0",
+        older ? earlierSlot(older) : new Uint8Array(0),
+      );
+      await writeStoreFile(
+        store,
+        ".uwasi.meta.1",
+        earlierSlot({
+          gen: 7,
+          next: 2,
+          root: { d: { a: { f: 0 }, sub: { d: { b: { f: 1 } } } } },
+        }),
+      );
+      const before = storeBytes(store);
+      await assert.rejects(
+        OPFSBackend.create(store.root),
+        /does not understand \(magic "UWM1", the JSON namespace of an earlier build/,
+      );
+      assert.deepStrictEqual(storeBytes(store), before, "the store changed");
+    }
+  });
+
+  it("refuses a store the previous binary format wrote, untouched", async () => {
+    // That format kept the magics this one replaced, with checksums that
+    // do not cover them. Taking its slots for torn writes would open the
+    // store as empty and reclaim the data files of every file it names.
+    const store = new MockOPFS();
+    for (const [name, base64] of Object.entries(UWS1_STORE)) {
+      await writeStoreFile(store, name, Buffer.from(base64, "base64"));
+    }
+    const before = storeBytes(store);
+    await assert.rejects(
+      OPFSBackend.create(store.root),
+      /does not understand \(magic "UWS1", the binary namespace of an earlier build/,
+    );
+    assert.deepStrictEqual(storeBytes(store), before, "the store changed");
+  });
+
+  it("takes a slot whose magic is partly zero and does not verify as torn", async () => {
+    const store = await twoSlotStore();
+    const [newest] = slotsByAge(store);
+    const slot = store.durableContent(newest);
+    await writeStoreFile(store, newest, patched(slot, [2, 0], [3, 0]));
+    await assertOlderSlotUsed(store, "UW\\0\\0");
+  });
+
+  it("nested directories, renames and symlinks survive re-init in order", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    assert.strictEqual(sysMkdir(w1.h, "a"), ESUCCESS);
+    assert.strictEqual(sysMkdir(w1.h, "a/b"), ESUCCESS);
+    putFile(w1.h, "a/b/deep", "deep");
+    putFile(w1.h, "a/top", "top");
+    putFile(w1.h, "zeta", "z");
+    putFile(w1.h, "alpha", "alpha");
+    assert.strictEqual(sysRename(w1.h, "a", "renamed"), ESUCCESS);
+    assert.strictEqual(sysRename(w1.h, "zeta", "renamed/b/zeta"), ESUCCESS);
+    assert.strictEqual(sysRename(w1.h, "alpha", "omega"), ESUCCESS);
+    const fs1 = w1.backend.fileSystem;
+    const order = (fs, path) => w1.backend.listChildren(fs.lookup(path));
+    const rootOrder = order(fs1, "/");
+    const innerOrder = order(fs1, "/renamed/b");
+    await w1.backend.close();
+
+    const w2 = await makeWorker(store);
+    const fs2 = w2.backend.fileSystem;
+    assert.deepStrictEqual(w2.backend.listChildren(fs2.lookup("/")), rootOrder);
+    assert.deepStrictEqual(
+      w2.backend.listChildren(fs2.lookup("/renamed/b")),
+      innerOrder,
+    );
+    for (const [path, text] of [
+      ["renamed/b/deep", "deep"],
+      ["renamed/b/zeta", "z"],
+      ["renamed/top", "top"],
+      ["omega", "alpha"],
+    ]) {
+      const opened = sysOpen(w2.h, path);
+      assert.strictEqual(opened.errno, ESUCCESS, path);
+      assert.strictEqual(sysReadText(w2.h, opened.fd).text, text, path);
+    }
+    assert.strictEqual(sysStat(w2.h, "a").errno, WASIAbi.WASI_ERRNO_NOENT);
+    await w2.backend.close();
   });
 });
 

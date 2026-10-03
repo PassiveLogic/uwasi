@@ -298,6 +298,18 @@ export class MemoryFileSystem {
   }
 
   /**
+   * Sets a node as a directory's entry, without resolving a path. Like
+   * `setNode`, it stamps inode metadata onto a bare node.
+   * @param dir Parent directory
+   * @param name Entry name (a single path component)
+   * @param node The node to set
+   */
+  setNodeIn(dir: DirectoryNode, name: string, node: FSNode): void {
+    stampMeta(node);
+    dir.entries[name] = node;
+  }
+
+  /**
    * Gets the /dev/null special device.
    * @returns The /dev/null node
    */

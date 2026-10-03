@@ -217,6 +217,12 @@ event loop turns (`fd_sync` fails honestly with `NOSPC` until then, and
 as do linking, renaming, replacing and unlinking device nodes such as
 `/dev/null`, which the runtime recreates at every open.
 
+The store format is not compatible with stores written by earlier builds
+of this OPFS backend, in its JSON format or an earlier binary one.
+`OPFSBackend.create` refuses such a store rather
+than open it, and leaves it untouched, as it does any store whose format
+it cannot read, such as one a later version wrote.
+
 ### Custom storage backends
 
 `uwasi/filesystem` exposes the synchronous `FSBackend` contract, namespace

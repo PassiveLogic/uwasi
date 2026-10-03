@@ -8,6 +8,18 @@ import {
   FSErrno,
   FSError,
 } from "../filesystem/index.js";
+import {
+  ByteWriter,
+  NsRecord,
+  Op,
+  ROOT_DIR_ID,
+  Snapshot,
+  UnknownFormatError,
+  beginSnapshot,
+  decodeSnapshot,
+  encodeRecord,
+  finishSnapshot,
+} from "./format.js";
 
 /**
  * The slice of the OPFS API surface the backend uses, typed structurally so
@@ -48,73 +60,29 @@ export interface OPFSDirectoryHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Durable metadata format
+// Store layout
 // ---------------------------------------------------------------------------
-
-/** Serialized namespace: a tree of names over physical file ids. */
-type MetaDir = { d: { [name: string]: MetaEntry } };
-type MetaEntry = MetaDir | { f: number } | { l: string };
-type MetaPayload = { gen: number; next: number; root: MetaDir };
 
 const META_NAMES = [".uwasi.meta.0", ".uwasi.meta.1"];
 const DATA_PREFIX = ".uwasi.data.";
-const META_MAGIC = new Uint8Array([0x55, 0x57, 0x4d, 0x31]); // "UWM1"
-const META_HEADER = 12; // magic + u32 body length + u32 FNV-1a of the body
 
 function dataName(id: number): string {
   return DATA_PREFIX + id;
 }
 
-function fnv1a(bytes: Uint8Array): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < bytes.length; i++) {
-    hash ^= bytes[i];
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-function encodeMeta(payload: MetaPayload): Uint8Array {
-  const body = new TextEncoder().encode(JSON.stringify(payload));
-  const buffer = new Uint8Array(META_HEADER + body.byteLength);
-  const view = new DataView(buffer.buffer);
-  buffer.set(META_MAGIC, 0);
-  view.setUint32(4, body.byteLength, true);
-  view.setUint32(8, fnv1a(body), true);
-  buffer.set(body, META_HEADER);
+function readAll(handle: OPFSSyncAccessHandle): Uint8Array {
+  const buffer = new Uint8Array(handle.getSize());
+  if (buffer.byteLength > 0) handle.read(buffer, { at: 0 });
   return buffer;
 }
 
-/** Parse a meta slot; `null` for an empty, torn or foreign slot. */
-function decodeMeta(handle: OPFSSyncAccessHandle): MetaPayload | null {
-  const size = handle.getSize();
-  if (size < META_HEADER) return null;
-  const buffer = new Uint8Array(size);
-  handle.read(buffer, { at: 0 });
-  for (let i = 0; i < META_MAGIC.length; i++) {
-    if (buffer[i] !== META_MAGIC[i]) return null;
-  }
-  const view = new DataView(buffer.buffer);
-  const length = view.getUint32(4, true);
-  if (META_HEADER + length > size) return null;
-  const body = buffer.subarray(META_HEADER, META_HEADER + length);
-  if (fnv1a(body) !== view.getUint32(8, true)) return null;
-  try {
-    const payload = JSON.parse(new TextDecoder().decode(body));
-    if (
-      typeof payload !== "object" ||
-      payload === null ||
-      typeof payload.gen !== "number" ||
-      typeof payload.next !== "number" ||
-      typeof payload.root !== "object"
-    ) {
-      return null;
-    }
-    return payload as MetaPayload;
-  } catch {
-    return null;
-  }
-}
+/** Live state while records rebuild the namespace at `init`. */
+type ReplayState = {
+  dirs: Map<number, DirectoryNode>;
+  files: Map<number, FileNode>;
+  maxDir: number;
+  maxFile: number;
+};
 
 const MAX_FILE_SIZE = Number.MAX_SAFE_INTEGER;
 
@@ -223,6 +191,14 @@ export class OPFSBackend implements FSBackend {
   private metaHandles: OPFSSyncAccessHandle[] = [];
   private generation = 0;
   private nextId = 0;
+  /**
+   * Directory node -> its id in the namespace records. Ids are assigned
+   * when a directory is first recorded and never reused.
+   */
+  private dirIds = new WeakMap<DirectoryNode, number>();
+  private nextDirId = ROOT_DIR_ID + 1;
+  /** Reused across snapshots to avoid regrowing the encode buffer. */
+  private encoder = new ByteWriter();
   /** Guest file node -> data-file id, for every persisted file. */
   private physByNode = new Map<FileNode, number>();
   /** Data-file id -> its always-open sync access handle. */
@@ -312,24 +288,37 @@ export class OPFSBackend implements FSBackend {
     }
 
     // Read both namespace-record slots; the highest intact generation wins.
-    let meta: MetaPayload | null = null;
+    // A slot this version cannot read stops the open before anything is
+    // changed (see `readSlot`).
+    let snapshot: Snapshot | null = null;
     for (const name of META_NAMES) {
       const fileHandle = await this.store.getFileHandle(name, { create: true });
       const handle = await fileHandle.createSyncAccessHandle();
       this.metaHandles.push(handle);
-      const slot = decodeMeta(handle);
-      if (slot && (!meta || slot.gen > meta.gen)) meta = slot;
+      const slot = this.readSlot(name, handle);
+      if (slot && (!snapshot || slot.gen > snapshot.gen)) snapshot = slot;
     }
-    this.generation = meta ? meta.gen : 0;
-    // Ids may have been handed out after the record was last written
-    // (background pool refills are not snapshotted); never reuse one.
-    this.nextId = Math.max(meta ? meta.next : 0, maxSeenId + 1);
+    this.generation = snapshot ? snapshot.gen : 0;
 
-    // Rebuild the guest namespace from the record alone. Data files the
-    // record does not reference belong to unlinked files, so they stay
+    // Rebuild the guest namespace from the records alone. Data files the
+    // records do not reference belong to unlinked files, so they stay
     // invisible to the guest whatever bytes they still hold.
     this.fileSystem = new MemoryFileSystem(preopens);
-    if (meta) this.graft(meta.root, "");
+    const root = this.fileSystem.lookup("/") as DirectoryNode;
+    this.dirIds.set(root, ROOT_DIR_ID);
+    const replay: ReplayState = {
+      dirs: new Map([[ROOT_DIR_ID, root]]),
+      files: new Map(),
+      maxDir: ROOT_DIR_ID,
+      maxFile: -1,
+    };
+    for (const record of snapshot ? snapshot.records : []) {
+      this.applyRecord(record, replay);
+    }
+    // Ids may have been handed out after the records were last written
+    // (background pool refills are not recorded); never reuse one.
+    this.nextId = Math.max(maxSeenId, replay.maxFile) + 1;
+    this.nextDirId = replay.maxDir + 1;
 
     // Claim every referenced data file's handle for life.
     for (const [, id] of this.physByNode) {
@@ -381,42 +370,129 @@ export class OPFSBackend implements FSBackend {
   }
 
   /**
-   * Rebuild the node tree from the namespace record. Children are created
-   * in record order - which `serializeDir` wrote in `entries` insertion
-   * order - so `listChildren` (and with it readdir cookie indexing) is
-   * stable across re-init.
+   * Decode the snapshot in slot `name`; `null` if it is empty or torn.
+   * Throws if the slot holds intact bytes in a format this version cannot
+   * read, such as the one earlier builds of this backend wrote, or one a
+   * later uwasi wrote. Opening anyway, from the other slot or as an empty
+   * store, would reclaim as unreferenced the data files of every file
+   * only that slot names, destroying their content.
    */
-  private graft(
-    dir: MetaDir,
-    base: string,
-    nodeById: Map<number, FileNode> = new Map(),
-  ): void {
-    for (const name of Object.keys(dir.d)) {
-      const child = dir.d[name];
-      const childPath = `${base}/${name}`;
-      if ("d" in child) {
-        this.fileSystem.ensureDir(childPath);
-        this.graft(child, childPath, nodeById);
-      } else if ("f" in child) {
-        let node = nodeById.get(child.f);
-        if (!node) {
-          node = this.fileSystem.createFile(childPath, new Uint8Array(0));
-          nodeById.set(child.f, node);
-          this.physByNode.set(node, child.f);
+  private readSlot(
+    name: string,
+    handle: OPFSSyncAccessHandle,
+  ): Snapshot | null {
+    try {
+      return decodeSnapshot(readAll(handle));
+    } catch (error) {
+      if (!(error instanceof UnknownFormatError)) throw error;
+      throw new Error(
+        `uwasi: ${name} holds a namespace snapshot this version does not understand (${error.message}); refusing to open the store rather than discard it`,
+      );
+    }
+  }
+
+  /**
+   * Apply one namespace record to the tree being rebuilt. Records come
+   * from a snapshot or, in order, from later changes, so each mirrors what
+   * the live `FSBackend` hook did to `entries` - including where a name
+   * lands in insertion order, which keeps `listChildren` (and with it
+   * readdir cookie indexing) stable across re-init. A record naming a
+   * parent or source that does not exist is skipped.
+   */
+  private applyRecord(record: NsRecord, replay: ReplayState): void {
+    switch (record.op) {
+      case Op.Mkdir: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        const existing = parent.entries[record.name];
+        let dir: DirectoryNode;
+        if (existing !== undefined && existing.type === "dir") {
+          // Preopens and /dev already exist in a fresh namespace.
+          dir = existing;
         } else {
-          // Two names for one id should not happen without hard links;
-          // keep them coherent by sharing the node if it ever does.
-          this.fileSystem.setNode(childPath, node);
+          this.forget(existing, replay);
+          // Null-prototype entries, as `makeDir` creates them.
+          dir = {
+            type: "dir",
+            entries: Object.create(null),
+          } as DirectoryNode;
+          this.fileSystem.setNodeIn(parent, record.name, dir);
         }
+        replay.dirs.set(record.dir, dir);
+        this.dirIds.set(dir, record.dir);
+        replay.maxDir = Math.max(replay.maxDir, record.dir);
+        return;
+      }
+      case Op.File: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        let node = replay.files.get(record.file);
+        if (parent.entries[record.name] !== node) {
+          this.forget(parent.entries[record.name], replay);
+        }
+        if (!node) {
+          node = {
+            type: "file",
+            content: new Uint8Array(0),
+            nlink: 1,
+          } as FileNode;
+          replay.files.set(record.file, node);
+          this.physByNode.set(node, record.file);
+        }
+        // Two names for one id should not happen without hard links;
+        // keep them coherent by sharing the node if it ever does.
+        this.fileSystem.setNodeIn(parent, record.name, node);
         this.known.add(node);
-      } else {
-        // `setNode` stamps inode metadata onto the bare node.
-        this.fileSystem.setNode(childPath, {
+        replay.maxFile = Math.max(replay.maxFile, record.file);
+        return;
+      }
+      case Op.Symlink: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        this.forget(parent.entries[record.name], replay);
+        this.fileSystem.setNodeIn(parent, record.name, {
           type: "symlink",
-          target: child.l,
+          target: record.target,
         } as SymlinkNode);
+        return;
+      }
+      case Op.Remove: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        const node = parent.entries[record.name];
+        if (node === undefined) return;
+        delete parent.entries[record.name];
+        this.forget(node, replay);
+        return;
+      }
+      case Op.Rename: {
+        const from = replay.dirs.get(record.fromParent);
+        const to = replay.dirs.get(record.toParent);
+        if (!from || !to) return;
+        const node = from.entries[record.fromName];
+        if (node === undefined) return;
+        const replaced = to.entries[record.toName];
+        delete from.entries[record.fromName];
+        to.entries[record.toName] = node;
+        if (replaced !== undefined && replaced !== node) {
+          this.forget(replaced, replay);
+        }
+        return;
       }
     }
+  }
+
+  /**
+   * A replayed record dropped `node`'s last name: release its data-file id
+   * so a later record may map the recycled id to a new file.
+   */
+  private forget(node: FSNode | undefined, replay: ReplayState): void {
+    if (node === undefined || node.type !== "file") return;
+    const id = this.physByNode.get(node);
+    if (id === undefined) return;
+    this.physByNode.delete(node);
+    this.known.delete(node);
+    if (replay.files.get(id) === node) replay.files.delete(id);
   }
 
   // -------------------------------------------------------------------
@@ -455,13 +531,11 @@ export class OPFSBackend implements FSBackend {
   private snapshotFlush(): void {
     const root = this.fileSystem.lookup("/") as DirectoryNode;
     const files: FileNode[] = [];
-    const record = this.serializeDir(root, files);
     const generation = this.generation + 1;
-    const buffer = encodeMeta({
-      gen: generation,
-      next: this.nextId,
-      root: record,
-    });
+    const out = this.encoder;
+    beginSnapshot(out, generation);
+    this.encodeDir(root, ROOT_DIR_ID, out, files);
+    const buffer = finishSnapshot(out);
     const handle = this.metaHandles[generation % 2];
     writeFully(handle, buffer, 0);
     handle.truncate(buffer.byteLength);
@@ -471,32 +545,55 @@ export class OPFSBackend implements FSBackend {
     this.spares.push(...this.quarantine.splice(0));
   }
 
-  /** Serialize `dir`'s subtree, collecting the file nodes it names. */
-  private serializeDir(dir: DirectoryNode, files: FileNode[]): MetaDir {
-    // Null prototype: a `__proto__` entry must stay an own property.
-    const d: { [name: string]: MetaEntry } = Object.create(null);
+  /**
+   * Emit the records that recreate `dir`'s subtree, in `entries` order,
+   * collecting the file nodes they name.
+   */
+  private encodeDir(
+    dir: DirectoryNode,
+    dirId: number,
+    out: ByteWriter,
+    files: FileNode[],
+  ): void {
     for (const name of Object.keys(dir.entries)) {
       const child = dir.entries[name];
       switch (child.type) {
-        case "dir":
-          d[name] = this.serializeDir(child, files);
+        case "dir": {
+          const id = this.dirIdOf(child);
+          encodeRecord(out, { op: Op.Mkdir, parent: dirId, name, dir: id });
+          this.encodeDir(child, id, out, files);
           break;
+        }
         case "file": {
           this.adopt(child);
           files.push(child);
-          const id = this.physByNode.get(child) ?? this.pendingIds.get(child)!;
-          d[name] = { f: id };
+          const file =
+            this.physByNode.get(child) ?? this.pendingIds.get(child)!;
+          encodeRecord(out, { op: Op.File, parent: dirId, name, file });
           break;
         }
         case "symlink":
-          d[name] = { l: child.target };
+          encodeRecord(out, {
+            op: Op.Symlink,
+            parent: dirId,
+            name,
+            target: child.target,
+          });
           break;
         case "character":
           // Recreated by the MemoryFileSystem constructor on re-init.
           break;
       }
     }
-    return { d };
+  }
+
+  private dirIdOf(dir: DirectoryNode): number {
+    let id = this.dirIds.get(dir);
+    if (id === undefined) {
+      id = this.nextDirId++;
+      this.dirIds.set(dir, id);
+    }
+    return id;
   }
 
   /**

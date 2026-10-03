@@ -108,8 +108,14 @@ make such an alias resolvable by Node or a browser.
 
 ## Unchanged Limits
 
-The OPFS on-disk metadata and data-file formats are unchanged. Sync access handles
-still require a worker and exclusive ownership by one live backend. Hard links
+The OPFS data-file format is unchanged. The namespace record is now binary (see
+[Namespace Record](#namespace-record)). The store format is not compatible with
+stores written by earlier builds of this fork's OPFS backend, in its JSON format
+or an earlier binary one: `create()` refuses
+such a store rather than open it, and leaves it untouched, as it does any store
+whose namespace it cannot read, such as one written by a later version.
+
+Sync access handles still require a worker and exclusive ownership by one live backend. Hard links
 remain unsupported, and so are links, renames and unlinks of device nodes such
 as `/dev/null`, which the runtime recreates at every open; both return `NOTSUP`.
 Inode numbers and timestamps are not persisted. Async startup,
@@ -145,3 +151,40 @@ for its guest buffer, not WASI constants. Its iovec contains a 32-bit buffer
 pointer followed by a 32-bit length. The preopen descriptor, create flag, seek
 origin and rights mask follow the WASI Preview 1 ABI. Payload values are test
 data; `UNCHANGED_OUTPUT` detects accidental result writes on a failed operation.
+
+## Namespace Record
+
+The OPFS backend persists guest names separately from file content. Each
+`.uwasi.data.<id>` file holds one guest file's bytes; the namespace record maps
+names to those ids. It is a sequence of binary records over directory ids and
+data-file ids:
+
+| Record    | Fields                               |
+| --------- | ------------------------------------ |
+| `MKDIR`   | parent dir, name, new dir id         |
+| `FILE`    | parent dir, name, data-file id       |
+| `SYMLINK` | parent dir, name, target             |
+| `REMOVE`  | parent dir, name                     |
+| `RENAME`  | from dir, from name, to dir, to name |
+
+Ids are LEB128 varints and names are length-prefixed UTF-8. The root directory
+is id 0. A snapshot is the `MKDIR`, `FILE`, and `SYMLINK` records that rebuild the
+tree from an empty root, in `entries` order, so re-init preserves directory
+listing order. Snapshots alternate between `.uwasi.meta.0` and `.uwasi.meta.1`,
+each framed as `"UWS2" | u32 body length | u32 checksum | body`, where the body is
+a varint generation followed by the records and the checksum is FNV-1a over the
+first 8 bytes (magic and length) continued over the body. Re-init loads the
+highest intact generation. A slot whose length or checksum does not verify is
+torn, and re-init falls back to the other one. A slot that verifies but that this
+version cannot read, under an unknown magic or as a `"UWS2"` body that does not
+decode, is intact: no torn write passes the checksum, since it covers the header.
+It may hold the newest namespace, so `create()` rejects without changing the store
+rather than fall back or open it as empty. So it does for a magic of four nonzero
+bytes it does not know, even if the checksum fails: a torn write of a known magic
+leaves a known magic or a zero byte, never that. The formats of earlier builds of
+this backend are refused the same way, by name: the JSON namespace under `"UWM1"`,
+and the binary one under `"UWS1"`, whose checksum covered the body alone.
+
+Every later format of these files must keep this header: a 4-byte magic first,
+new for any change in format, and a checksum that covers it. That is what lets an
+older version tell a store it must refuse from one it may recover.
