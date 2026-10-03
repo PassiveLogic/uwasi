@@ -65,7 +65,12 @@ export function stampMeta<T extends object>(node: T): T & NodeMeta {
   return meta;
 }
 export function makeDir(): DirectoryNode {
-  return stampMeta({ type: "dir" as const, entries: {} });
+  // Null prototype, so guest names such as `constructor` or `__proto__`
+  // never resolve to (or overwrite) inherited Object properties.
+  return stampMeta({
+    type: "dir" as const,
+    entries: Object.create(null) as Record<string, FSNode>,
+  });
 }
 export function makeFile(content: Uint8Array): FileNode {
   // Web IDL rejects views over a resizable buffer wherever it expects a

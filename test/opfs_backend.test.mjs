@@ -528,6 +528,41 @@ describe("OPFSBackend", () => {
     );
     await w.backend.close();
   });
+
+  it("names shadowing Object.prototype members persist across re-init", async () => {
+    const names = ["constructor", "__proto__", "toString", "hasOwnProperty"];
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    for (const name of names) {
+      assert.strictEqual(sysStat(w1.h, name).errno, WASIAbi.WASI_ERRNO_NOENT);
+      putFile(w1.h, name, `content of ${name}`);
+    }
+    assert.strictEqual(sysMkdir(w1.h, "valueOf"), ESUCCESS);
+    putFile(w1.h, "valueOf/__proto__", "nested");
+    await w1.backend.close();
+
+    const w2 = await makeWorker(store);
+    const root = w2.backend.fileSystem.lookup("/");
+    assert.deepStrictEqual(
+      w2.backend
+        .listChildren(root)
+        .filter((n) => n !== "dev")
+        .sort(),
+      [...names, "valueOf"].sort(),
+    );
+    for (const name of names) {
+      const opened = sysOpen(w2.h, name);
+      assert.strictEqual(opened.errno, ESUCCESS, `reopening ${name}`);
+      assert.strictEqual(
+        sysReadText(w2.h, opened.fd).text,
+        `content of ${name}`,
+      );
+    }
+    const nested = sysOpen(w2.h, "valueOf/__proto__");
+    assert.strictEqual(nested.errno, ESUCCESS);
+    assert.strictEqual(sysReadText(w2.h, nested.fd).text, "nested");
+    await w2.backend.close();
+  });
 });
 
 /** Name of the root-level data file whose durable bytes contain `text`. */

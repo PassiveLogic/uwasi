@@ -387,7 +387,8 @@ export class OPFSBackend implements FSBackend {
 
   /** Serialize `dir`'s subtree, collecting the file nodes it names. */
   private serializeDir(dir: DirectoryNode, files: FileNode[]): MetaDir {
-    const d: { [name: string]: MetaEntry } = {};
+    // Null prototype: a `__proto__` entry must stay an own property.
+    const d: { [name: string]: MetaEntry } = Object.create(null);
     for (const name of Object.keys(dir.entries)) {
       const child = dir.entries[name];
       switch (child.type) {

@@ -175,3 +175,31 @@ describe("fd.bindFSSyscalls backend seam", () => {
     assert.ok(backend.calls.includes("removeChild"));
   });
 });
+
+describe("MemoryFileSystem directory entries", () => {
+  it("names shadowing Object.prototype members are ordinary entries", async () => {
+    const { bindImports, sysCreate, sysClose, sysStat, sysMkdir } =
+      await import("./syscall_harness.mjs");
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const backend = new MemoryFSBackend();
+    const h = bindImports(backend, fs);
+    const names = ["constructor", "__proto__", "toString", "hasOwnProperty"];
+    for (const name of names) {
+      assert.strictEqual(sysStat(h, name).errno, WASIAbi.WASI_ERRNO_NOENT);
+      const { errno, fd } = sysCreate(h, name);
+      assert.strictEqual(errno, ESUCCESS, `creating ${name}`);
+      assert.strictEqual(sysClose(h, fd), ESUCCESS);
+      assert.strictEqual(sysStat(h, name).errno, ESUCCESS);
+    }
+    assert.strictEqual(sysMkdir(h, "__defineGetter__"), ESUCCESS);
+    fs.addFile("/__defineGetter__/constructor", "seeded");
+    assert.strictEqual(sysStat(h, "__defineGetter__/constructor").size, 6);
+    assert.deepStrictEqual(
+      backend
+        .listChildren(fs.lookup("/"))
+        .filter((n) => n !== "dev")
+        .sort(),
+      [...names, "__defineGetter__"].sort(),
+    );
+  });
+});
