@@ -1014,6 +1014,621 @@ describe("namespace record format", () => {
   });
 });
 
+const LOG = ".uwasi.meta.log";
+
+function metaWrites(store, path) {
+  return store.opLog.filter((e) => e.op === "write" && e.path === `/${path}`);
+}
+
+/** path_open of a directory: every right but FD_WRITE, all to inherit. */
+function sysOpenDir(h, name, dirfd = 3) {
+  const path = new TextEncoder().encode(name);
+  h.bytes.set(path, 0);
+  const rights = BigInt((1 << 30) - 1) & ~(1n << 6n); // FD_WRITE
+  const errno = h.imports.path_open(
+    dirfd,
+    0,
+    0,
+    path.length,
+    WASIAbi.WASI_OFLAGS_DIRECTORY,
+    rights,
+    BigInt((1 << 30) - 1),
+    0,
+    4096,
+  );
+  return { errno, fd: h.view.getUint32(4096, true) };
+}
+
+describe("namespace change log", () => {
+  // A guest can still change a directory it removed, through an fd it
+  // holds open, and move things out of it again. A compaction drops the
+  // detached directory from the record, so no later record may name it.
+  for (const via of ["created in it", "moved into it"]) {
+    it(`a file ${via} after its directory was removed, then renamed out, survives a crash`, async () => {
+      const store = new MockOPFS();
+      const w = await makeWorker(store, { spareFiles: 4 });
+      for (const dir of ["x", "y"]) {
+        assert.strictEqual(sysMkdir(w.h, dir), ESUCCESS);
+      }
+      const x = sysOpenDir(w.h, "x");
+      assert.strictEqual(x.errno, ESUCCESS);
+      const encoder = new TextEncoder();
+      w.h.bytes.set(encoder.encode("x"), 0);
+      assert.strictEqual(w.h.imports.path_remove_directory(3, 0, 1), ESUCCESS);
+      // The file to rescue, in "x" itself or in "y" moved into "x".
+      let from = x.fd;
+      if (via === "moved into it") {
+        w.h.bytes.set(encoder.encode("y"), 0);
+        w.h.bytes.set(encoder.encode("y"), 128);
+        assert.strictEqual(w.h.imports.path_rename(3, 0, 1, x.fd, 128, 1), 0);
+        const y = sysOpenDir(w.h, "y", x.fd);
+        assert.strictEqual(y.errno, ESUCCESS);
+        from = y.fd;
+        await w.backend.persistAll(); // compacts: "y" is out of the tree
+      }
+      const inner = sysCreate(w.h, "a", from);
+      assert.strictEqual(inner.errno, ESUCCESS);
+      assert.strictEqual(sysWrite(w.h, inner.fd, "DETACHED").errno, ESUCCESS);
+      assert.strictEqual(sysSync(w.h, inner.fd), ESUCCESS);
+      await w.backend.persistAll(); // compacts
+      w.h.bytes.set(encoder.encode("a"), 0);
+      w.h.bytes.set(encoder.encode("b"), 128);
+      assert.strictEqual(w.h.imports.path_rename(from, 0, 1, 3, 128, 1), 0);
+      assert.strictEqual(sysStat(w.h, "b").errno, ESUCCESS);
+      store.simulateCrash();
+      const fresh = await makeWorker(store);
+      const b = sysOpen(fresh.h, "b");
+      assert.strictEqual(b.errno, ESUCCESS, "the rename was durable");
+      assert.strictEqual(sysReadText(fresh.h, b.fd).text, "DETACHED");
+      await fresh.backend.close();
+    });
+  }
+
+  it("compacts once the log outgrows its threshold (test-only override)", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 4 });
+    // Not an option: an internal knob that lets tests reach compaction
+    // without writing 64 KiB of records.
+    w.backend.compactAt = { minBytes: 0, ratio: 0 };
+    store.opLog.length = 0;
+    putFile(w.h, "a", "A");
+    assert.ok(
+      metaWrites(store, ".uwasi.meta.0").length +
+        metaWrites(store, ".uwasi.meta.1").length >
+        0,
+      "an append past the threshold compacts",
+    );
+    assert.strictEqual(sysMkdir(w.h, "d"), ESUCCESS);
+    assert.strictEqual(sysRename(w.h, "a", "d/b"), ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store);
+    assert.strictEqual(
+      sysReadText(fresh.h, sysOpen(fresh.h, "d/b").fd).text,
+      "A",
+    );
+    await fresh.backend.close();
+  });
+
+  /** Open, change, crash: a store whose log holds `names`' creates. */
+  async function loggedStore(...names) {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    for (const name of names) sysClose(w.h, sysCreate(w.h, name).fd);
+    store.simulateCrash();
+    return store;
+  }
+
+  async function assertLogRefusedUntouched(store, why = /does not understand/) {
+    const before = new Map(
+      store.rootNames().map((name) => [name, store.durableContent(name)]),
+    );
+    await assert.rejects(OPFSBackend.create(store.root), why);
+    assert.deepStrictEqual(
+      new Map(
+        store.rootNames().map((name) => [name, store.durableContent(name)]),
+      ),
+      before,
+      "the store was changed",
+    );
+  }
+
+  /** Re-seal a log header: FNV-1a over the magic, then the generation. */
+  function sealLogHeader(log) {
+    const view = new DataView(log.buffer, log.byteOffset);
+    view.setUint32(
+      4,
+      fnv1a(log.subarray(8, 16), fnv1a(log.subarray(0, 4))),
+      true,
+    );
+    return log;
+  }
+
+  /** `log` plus a frame of `body` that verifies at its end. */
+  function withFrame(log, body) {
+    const seed = new Uint8Array(8);
+    const seedView = new DataView(seed.buffer);
+    seedView.setUint32(
+      0,
+      new DataView(log.buffer, log.byteOffset).getUint32(8, true),
+      true,
+    );
+    seedView.setUint32(4, log.byteLength, true);
+    const frame = new Uint8Array(8 + body.byteLength);
+    const view = new DataView(frame.buffer);
+    view.setUint32(0, body.byteLength, true);
+    view.setUint32(4, fnv1a(body, fnv1a(seed)), true);
+    frame.set(body, 8);
+    const out = new Uint8Array(log.byteLength + frame.byteLength);
+    out.set(log, 0);
+    out.set(frame, log.byteLength);
+    return out;
+  }
+
+  it("refuses to open a store whose log is in an unknown format", async () => {
+    const store = await loggedStore("a");
+    // A later log format: the header's checksum verifies, its magic is new.
+    const log = store.durableContent(LOG);
+    log.set(new TextEncoder().encode("UWL3"), 0);
+    await writeStoreFile(store, LOG, sealLogHeader(log));
+    await assertLogRefusedUntouched(store);
+  });
+
+  it("refuses a log whose magic is unknown, however its checksum fares", async () => {
+    const store = await loggedStore("a");
+    const log = store.durableContent(LOG);
+    log[3] = 0x33; // "UWL3", the checksum left as it was
+    await writeStoreFile(store, LOG, log);
+    await assertLogRefusedUntouched(store);
+  });
+
+  it("refuses the log of the previous binary format", async () => {
+    // Its header check does not cover the magic, so under this version's
+    // check it would pass for torn and be reset, losing its changes.
+    const store = await loggedStore("a");
+    const log = Buffer.from(UWS1_STORE[LOG], "base64");
+    await writeStoreFile(store, LOG, log);
+    await assertLogRefusedUntouched(
+      store,
+      /does not understand \(magic "UWL1", the change log of an earlier build/,
+    );
+  });
+
+  it("ignores a log whose header checksum fails over its magic", async () => {
+    // The checksum covers the magic: a zeroed magic byte is a tear.
+    const store = await loggedStore("a");
+    const log = store.durableContent(LOG);
+    log[3] = 0;
+    await writeStoreFile(store, LOG, log);
+    const fresh = await makeWorker(store);
+    assert.strictEqual(sysStat(fresh.h, "a").errno, WASIAbi.WASI_ERRNO_NOENT);
+    await fresh.backend.close();
+  });
+
+  // A frame that verifies was written whole at its offset in this log, so
+  // one that does not decode is not a tear. Ending replay there would lose
+  // the changes after it for good, as the open compacts.
+  for (const [what, body] of [
+    ["an unknown op", [99, 0, 1, 0x61]],
+    ["trailing bytes", [4, 0, 1, 0x61, 0]], // REMOVE 0 "a", then a 0
+    ["a truncated record", [4, 0, 5, 0x61]],
+  ]) {
+    it(`refuses a log with a frame that verifies but holds ${what}`, async () => {
+      const store = await loggedStore("a");
+      const log = withFrame(store.durableContent(LOG), new Uint8Array(body));
+      await writeStoreFile(store, LOG, log);
+      await assertLogRefusedUntouched(store);
+    });
+  }
+
+  it("a data file logged under a second live name never aliases the first", async () => {
+    // The backend never logs this; replay must still not share the bytes.
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    putFile(w.h, "a", "A-CONTENT");
+    store.simulateCrash();
+    const id = Number(
+      findDataFileContaining(store, "A-CONTENT").slice(".uwasi.data.".length),
+    );
+    assert.ok(id < 0x80, "a one-byte varint keeps the record simple");
+    const file = [2, 0, 1, 0x62, id]; // FILE 0 "b" <id>
+    const log = withFrame(store.durableContent(LOG), new Uint8Array(file));
+    await writeStoreFile(store, LOG, log);
+    const fresh = await makeWorker(store);
+    assert.strictEqual(
+      sysReadText(fresh.h, sysOpen(fresh.h, "b").fd).text,
+      "A-CONTENT",
+    );
+    assert.strictEqual(sysStat(fresh.h, "a").size, 0, "a is left empty");
+    await fresh.backend.close();
+  });
+
+  it("a verified frame appended by hand replays", async () => {
+    // The helpers above build frames as the backend does.
+    const store = await loggedStore("a", "b");
+    const remove = [4, 0, 1, 0x61]; // REMOVE 0 "a"
+    const log = withFrame(store.durableContent(LOG), new Uint8Array(remove));
+    await writeStoreFile(store, LOG, log);
+    const fresh = await makeWorker(store);
+    assert.strictEqual(sysStat(fresh.h, "a").errno, WASIAbi.WASI_ERRNO_NOENT);
+    assert.strictEqual(sysStat(fresh.h, "b").errno, ESUCCESS);
+    await fresh.backend.close();
+  });
+
+  it("namespace changes append small records instead of rewriting the tree", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    store.opLog.length = 0;
+    for (let i = 0; i < 300; i++) {
+      const { errno, fd } = sysCreate(w.h, `object-${i}`);
+      assert.strictEqual(errno, ESUCCESS);
+      sysClose(w.h, fd);
+    }
+    const appends = metaWrites(store, LOG);
+    assert.strictEqual(appends.length, 300, "one append per create");
+    assert.ok(
+      appends.every((e) => e.length < 64),
+      "each append holds one record",
+    );
+    assert.strictEqual(
+      metaWrites(store, ".uwasi.meta.0").length +
+        metaWrites(store, ".uwasi.meta.1").length,
+      0,
+      "no snapshot below the compaction threshold",
+    );
+    await w.backend.close();
+  });
+
+  it("logged changes survive a crash", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    assert.strictEqual(sysMkdir(w1.h, "dir"), ESUCCESS);
+    putFile(w1.h, "dir/kept", "kept");
+    putFile(w1.h, "moved", "moved");
+    putFile(w1.h, "gone", "gone");
+    assert.strictEqual(sysRename(w1.h, "moved", "dir/arrived"), ESUCCESS);
+    assert.strictEqual(sysUnlink(w1.h, "gone"), ESUCCESS);
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(
+      sysReadText(w2.h, sysOpen(w2.h, "dir/kept").fd).text,
+      "kept",
+    );
+    assert.strictEqual(
+      sysReadText(w2.h, sysOpen(w2.h, "dir/arrived").fd).text,
+      "moved",
+    );
+    assert.strictEqual(sysStat(w2.h, "moved").errno, WASIAbi.WASI_ERRNO_NOENT);
+    assert.strictEqual(sysStat(w2.h, "gone").errno, WASIAbi.WASI_ERRNO_NOENT);
+    await w2.backend.close();
+  });
+
+  it("a torn final record loses only that change, and logging resumes", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    sysClose(w1.h, sysCreate(w1.h, "a").fd);
+    sysClose(w1.h, sysCreate(w1.h, "b").fd);
+    store.simulateCrash();
+    const log = store.durableContent(LOG);
+    await writeStoreFile(store, LOG, log.subarray(0, log.byteLength - 1));
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(sysStat(w2.h, "a").errno, ESUCCESS);
+    assert.strictEqual(sysStat(w2.h, "b").errno, WASIAbi.WASI_ERRNO_NOENT);
+    sysClose(w2.h, sysCreate(w2.h, "c").fd);
+    store.simulateCrash();
+
+    const w3 = await makeWorker(store);
+    assert.strictEqual(sysStat(w3.h, "a").errno, ESUCCESS);
+    assert.strictEqual(sysStat(w3.h, "c").errno, ESUCCESS);
+    await w3.backend.close();
+  });
+
+  it("a log whose header does not verify is ignored", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    putFile(w1.h, "snapshotted", "s");
+    await w1.backend.close();
+    const w2 = await makeWorker(store);
+    sysClose(w2.h, sysCreate(w2.h, "logged").fd);
+    store.simulateCrash();
+    const log = store.durableContent(LOG);
+    log[8] ^= 0x01; // the generation the log claims to build on
+    await writeStoreFile(store, LOG, log);
+
+    const w3 = await makeWorker(store);
+    assert.strictEqual(sysStat(w3.h, "snapshotted").errno, ESUCCESS);
+    assert.strictEqual(sysStat(w3.h, "logged").errno, WASIAbi.WASI_ERRNO_NOENT);
+    await w3.backend.close();
+  });
+
+  it("compaction folds the log into a snapshot and loses nothing", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store, { spareFiles: 1 });
+    store.opLog.length = 0;
+    const count = 2000;
+    for (let i = 0; i < count; i++) {
+      const name = `objects-${String(i).padStart(4, "0")}-${"x".repeat(32)}`;
+      sysClose(w1.h, sysCreate(w1.h, name).fd);
+    }
+    assert.ok(
+      metaWrites(store, ".uwasi.meta.0").length +
+        metaWrites(store, ".uwasi.meta.1").length >
+        0,
+      "the log must have been compacted at least once",
+    );
+    assert.ok(
+      store.opLog.some(
+        (e) => e.path === `/${LOG}` && e.op === "truncate" && e.size === 16,
+      ),
+      "compaction must reset the log to its header",
+    );
+    await w1.backend.settle();
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    const root = w2.backend.fileSystem.lookup("/");
+    const names = w2.backend.listChildren(root).filter((n) => n !== "dev");
+    assert.strictEqual(names.length, count);
+    assert.strictEqual(names[0], `objects-0000-${"x".repeat(32)}`);
+    assert.strictEqual(names[count - 1], `objects-1999-${"x".repeat(32)}`);
+    await w2.backend.close();
+  });
+
+  it("a recycled data-file id maps to its newest name after replay", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store, { spareFiles: 1 });
+    putFile(w1.h, "first", "FIRST");
+    const id = findDataFileContaining(store, "FIRST");
+    assert.strictEqual(sysUnlink(w1.h, "first"), ESUCCESS);
+    putFile(w1.h, "second", "SECOND");
+    assert.strictEqual(
+      findDataFileContaining(store, "SECOND"),
+      id,
+      "the unlinked file's data file is reused",
+    );
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(sysStat(w2.h, "first").errno, WASIAbi.WASI_ERRNO_NOENT);
+    assert.strictEqual(
+      sysReadText(w2.h, sysOpen(w2.h, "second").fd).text,
+      "SECOND",
+    );
+    await w2.backend.close();
+  });
+
+  it("a failed unlink never lets its name alias the recycled data file", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store, { spareFiles: 1 });
+    putFile(w1.h, "victim", "OLD");
+    const injected = store.injectShortWrite(".uwasi.meta.", 4);
+    assert.strictEqual(sysUnlink(w1.h, "victim"), WASIAbi.WASI_ERRNO_NOSPC);
+    assert.strictEqual(injected.fired, 1);
+    // The content died in step 1. The record still names its data file,
+    // so the file stays out of the pool: the next create gets another.
+    await w1.backend.settle();
+    putFile(w1.h, "newcomer", "NEW");
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(
+      sysReadText(w2.h, sysOpen(w2.h, "newcomer").fd).text,
+      "NEW",
+    );
+    const victim = sysStat(w2.h, "victim");
+    assert.strictEqual(victim.errno, ESUCCESS, "the unlink did not happen");
+    assert.strictEqual(victim.size, 0, "but its content is gone, not NEW");
+    await w2.backend.close();
+  });
+
+  it("an unlink recorded in the log frees its data file at once", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    putFile(w.h, "first", "FIRST");
+    await w.backend.settle();
+    assert.strictEqual(sysUnlink(w.h, "first"), ESUCCESS);
+    // One spare from the refill, one from the unlink: neither create
+    // overdrafts, so both sync at once, before any settle().
+    putFile(w.h, "second", "SECOND");
+    putFile(w.h, "third", "THIRD");
+    await w.backend.close();
+  });
+
+  it("a failed log reset falls back to snapshots without losing changes", async () => {
+    const store = new MockOPFS();
+    const w1 = await makeWorker(store);
+    const injected = store.injectTruncateError(LOG);
+    await w1.backend.persistAll();
+    assert.strictEqual(injected.fired, 1);
+    store.opLog.length = 0;
+    sysClose(w1.h, sysCreate(w1.h, "after").fd);
+    assert.ok(
+      metaWrites(store, ".uwasi.meta.0").length +
+        metaWrites(store, ".uwasi.meta.1").length >
+        0,
+      "a change over a stale log is recorded by a full snapshot",
+    );
+    assert.deepStrictEqual(
+      metaWrites(store, LOG).map((e) => [e.at, e.length]),
+      [[0, 16]],
+      "the stale log takes no append, only the retried reset",
+    );
+    store.opLog.length = 0;
+    sysClose(w1.h, sysCreate(w1.h, "later").fd);
+    assert.strictEqual(
+      metaWrites(store, LOG)[0].at,
+      16,
+      "once reset, changes append again",
+    );
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    assert.strictEqual(sysStat(w2.h, "after").errno, ESUCCESS);
+    assert.strictEqual(sysStat(w2.h, "later").errno, ESUCCESS);
+    await w2.backend.close();
+  });
+
+  it("later directory sync cannot publish a failed snapshot and discard newer log entries", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    sysClose(w.h, sysCreate(w.h, "before").fd);
+    // The snapshot is complete in its slot when the truncate fails.
+    const injected = store.injectTruncateError(".uwasi.meta.");
+    await assert.rejects(w.backend.persistAll());
+    assert.strictEqual(injected.fired, 1);
+    const later = sysCreate(w.h, "after");
+    assert.strictEqual(later.errno, ESUCCESS);
+    assert.strictEqual(sysWrite(w.h, later.fd, "AFTER").errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, later.fd), ESUCCESS);
+    assert.strictEqual(sysSync(w.h, 3), ESUCCESS); // the preopen directory
+    store.simulateCrash();
+    const fresh = await makeWorker(store);
+    assert.strictEqual(sysStat(fresh.h, "before").errno, ESUCCESS);
+    const opened = sysOpen(fresh.h, "after");
+    assert.strictEqual(opened.errno, ESUCCESS);
+    assert.strictEqual(sysReadText(fresh.h, opened.fd).text, "AFTER");
+    await fresh.backend.close();
+  });
+
+  // Every point at which a snapshot or the log reset after it can fail.
+  // Whatever a slot or the log is left holding, possibly made durable by
+  // the next directory sync, recovery must show every later change.
+  const SLOT = /\.uwasi\.meta\.[01]$/;
+  const LOG_PATH = /\.uwasi\.meta\.log$/;
+  for (const [what, fault, persistFails] of [
+    ["snapshot write", { op: "write", match: SLOT }, true],
+    ["short snapshot write", { op: "write", match: SLOT, short: 5 }, true],
+    ["snapshot truncate", { op: "truncate", match: SLOT }, true],
+    ["snapshot flush", { op: "flush", match: SLOT }, true],
+    ["log reset write", { op: "write", match: LOG_PATH }, false],
+    [
+      "short log reset write",
+      { op: "write", match: LOG_PATH, short: 3 },
+      false,
+    ],
+    ["log reset truncate", { op: "truncate", match: LOG_PATH }, false],
+    ["log reset flush", { op: "flush", match: LOG_PATH }, false],
+  ]) {
+    it(`a failed ${what} loses no change made after it`, async () => {
+      const store = new MockOPFS();
+      const w = await makeWorker(store, { spareFiles: 4 });
+      sysClose(w.h, sysCreate(w.h, "before").fd);
+      const armed = store.injectFault(fault);
+      if (persistFails) {
+        await assert.rejects(w.backend.persistAll());
+      } else {
+        await w.backend.persistAll();
+      }
+      assert.strictEqual(armed.fired, 1);
+      assert.strictEqual(sysMkdir(w.h, "dir"), ESUCCESS);
+      putFile(w.h, "dir/after", "AFTER");
+      assert.strictEqual(sysRename(w.h, "before", "dir/moved"), ESUCCESS);
+      putFile(w.h, "last", "LAST");
+      assert.strictEqual(sysSync(w.h, 3), ESUCCESS);
+      store.simulateCrash();
+
+      const fresh = await makeWorker(store);
+      const root = fresh.backend.fileSystem.lookup("/");
+      const dir = fresh.backend.fileSystem.lookup("/dir");
+      assert.deepStrictEqual(
+        fresh.backend.listChildren(root).filter((n) => n !== "dev"),
+        ["dir", "last"],
+      );
+      assert.deepStrictEqual(fresh.backend.listChildren(dir), [
+        "after",
+        "moved",
+      ]);
+      const after = sysOpen(fresh.h, "dir/after");
+      assert.strictEqual(sysReadText(fresh.h, after.fd).text, "AFTER");
+      await fresh.backend.close();
+    });
+  }
+
+  it("a clean close does not publish a snapshot that failed", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    sysClose(w.h, sysCreate(w.h, "kept").fd);
+    w.backend.fileSystem.addFile("/seeded", "payload");
+    // Renaming an unrecorded file takes a snapshot, which already holds
+    // the rename when its flush fails.
+    const fault = store.injectFault({ op: "flush", match: SLOT });
+    assert.notStrictEqual(sysRename(w.h, "seeded", "renamed"), ESUCCESS);
+    assert.strictEqual(fault.fired, 1);
+    await w.backend.close();
+    const fresh = await makeWorker(store);
+    assert.strictEqual(sysStat(fresh.h, "kept").errno, ESUCCESS);
+    assert.strictEqual(
+      sysStat(fresh.h, "renamed").errno,
+      WASIAbi.WASI_ERRNO_NOENT,
+      "the failed rename did not happen",
+    );
+    await fresh.backend.close();
+  });
+
+  it("renaming a seeded file persists the successful namespace change", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    w.backend.fileSystem.addFile("/seeded", "payload");
+    assert.strictEqual(sysRename(w.h, "seeded", "moved"), ESUCCESS);
+    await w.backend.close();
+    const fresh = await makeWorker(store);
+    assert.strictEqual(
+      sysStat(fresh.h, "seeded").errno,
+      WASIAbi.WASI_ERRNO_NOENT,
+    );
+    const moved = sysOpen(fresh.h, "moved");
+    assert.strictEqual(moved.errno, ESUCCESS);
+    assert.strictEqual(sysReadText(fresh.h, moved.fd).text, "payload");
+    await fresh.backend.close();
+  });
+
+  it("renaming a seeded file over a recorded one survives a crash", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    const old = sysCreate(w.h, "target");
+    assert.strictEqual(sysWrite(w.h, old.fd, "old target").errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, old.fd), ESUCCESS);
+    // The open fd defers destroying the replaced content past the crash.
+    w.backend.fileSystem.addFile("/seeded", "seeded");
+    assert.strictEqual(sysRename(w.h, "seeded", "target"), ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store);
+    assert.strictEqual(
+      sysStat(fresh.h, "seeded").errno,
+      WASIAbi.WASI_ERRNO_NOENT,
+    );
+    const target = sysOpen(fresh.h, "target");
+    assert.strictEqual(target.errno, ESUCCESS);
+    assert.strictEqual(sysReadText(fresh.h, target.fd).text, "seeded");
+    await fresh.backend.close();
+  });
+
+  it("renames of seeded directories and symlinks persist", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    w.backend.fileSystem.addFile("/seeded-dir/inner", "inner");
+    w.backend.fileSystem.setNode("/seeded-link", {
+      type: "symlink",
+      target: "seeded-dir/inner",
+    });
+    assert.strictEqual(sysRename(w.h, "seeded-dir", "dir"), ESUCCESS);
+    assert.strictEqual(sysRename(w.h, "seeded-link", "link"), ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store);
+    const root = fresh.backend.fileSystem.lookup("/");
+    assert.deepStrictEqual(
+      fresh.backend.listChildren(root).filter((n) => n !== "dev"),
+      ["dir", "link"],
+    );
+    assert.strictEqual(
+      fresh.backend.fileSystem.lookup("/link").target,
+      "seeded-dir/inner",
+    );
+    await fresh.backend.close();
+  });
+});
+
 describe("atomic rename over an existing target", () => {
   it("rename-replace records the new mapping before destroying the replaced content", async () => {
     const store = new MockOPFS();

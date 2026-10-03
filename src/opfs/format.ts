@@ -15,7 +15,7 @@
 // and a checksum that covers it. That is what lets an older version tell
 // a later format, which it must refuse, from a torn write, which it may
 // ignore. The magics of earlier formats are refused by name (see
-// `EARLIER_SLOTS`).
+// `EARLIER_SLOTS` and `EARLIER_LOGS`).
 
 /** Directory id of the namespace root. */
 export const ROOT_DIR_ID = 0;
@@ -383,4 +383,152 @@ function magicOf(buffer: Uint8Array): string {
 
 function hasMagic(buffer: Uint8Array, magic: number[]): boolean {
   return magic.every((byte, i) => buffer[i] === byte);
+}
+
+// ---------------------------------------------------------------------------
+// Change log
+// ---------------------------------------------------------------------------
+
+/**
+ * Log layout:
+ *
+ *   "UWL2" | u32 check | u32 gen low | u32 gen high
+ *   then frames: u32 body length | u32 check | body (one record)
+ *
+ * The header's check is FNV-1a over the magic (bytes 0..4), continued
+ * over the generation (bytes 8..16), so as for a slot no torn header
+ * passes for an intact one. This version writes "UWL2" only over "UWL2"
+ * or zeros, so an unknown magic of four nonzero bytes is refused whatever
+ * its check (see `decodeSnapshot`).
+ *
+ * The header names the snapshot generation the log builds on; a log whose
+ * generation is not the loaded snapshot's is ignored, because compaction
+ * writes the next snapshot before it resets the log. A frame's check is
+ * FNV-1a of its body seeded with the generation and the frame's offset, so
+ * bytes left over from an earlier generation, or from a frame that sat at
+ * another offset, never pass as a record. A complete frame that a failed
+ * append left at the end of the log does verify: the failed change may
+ * take effect after all. Replay stops at the first frame that does not
+ * verify: an append is acknowledged only after its flush, so anything past
+ * that point was never reported durable. A frame that verifies but does
+ * not decode to exactly one record was written whole, so it is not a tear
+ * but a format this version cannot read, and the log is refused: ending
+ * replay there would drop every change after it for good, as the open
+ * compacts.
+ */
+export const LOG_HEADER = 16;
+const LOG_MAGIC = [0x55, 0x57, 0x4c, 0x32]; // "UWL2"
+const FRAME_HEADER = 8;
+
+/**
+ * Log formats that earlier builds of this backend wrote and this version
+ * does not read: "UWL1", whose header check covered the generation alone.
+ */
+const EARLIER_LOGS: [number[], string][] = [
+  [
+    [0x55, 0x57, 0x4c, 0x31], // "UWL1"
+    "the change log of an earlier build of this backend, whose check does not cover the magic",
+  ],
+];
+
+function splitGen(gen: number): [number, number] {
+  return [gen >>> 0, Math.floor(gen / 0x100000000)];
+}
+
+export function encodeLogHeader(gen: number): Uint8Array {
+  const header = new Uint8Array(LOG_HEADER);
+  const view = new DataView(header.buffer);
+  header.set(LOG_MAGIC, 0);
+  const [low, high] = splitGen(gen);
+  view.setUint32(8, low, true);
+  view.setUint32(12, high, true);
+  view.setUint32(4, logHeaderCheck(header), true);
+  return header;
+}
+
+function logHeaderCheck(header: Uint8Array): number {
+  return fnv1a(header.subarray(8, LOG_HEADER), fnv1a(header.subarray(0, 4)));
+}
+
+function frameSeed(gen: number, offset: number): number {
+  const seed = new Uint8Array(8);
+  const view = new DataView(seed.buffer);
+  view.setUint32(0, splitGen(gen)[0], true);
+  view.setUint32(4, offset >>> 0, true);
+  return fnv1a(seed);
+}
+
+/** Encode `record` as the frame to append at `offset` of a `gen` log. */
+export function encodeFrame(
+  out: ByteWriter,
+  record: NsRecord,
+  gen: number,
+  offset: number,
+): Uint8Array {
+  out.reset();
+  out.u32(0);
+  out.u32(0);
+  encodeRecord(out, record);
+  const body = out.bytes(FRAME_HEADER);
+  out.patchU32(0, body.byteLength);
+  out.patchU32(4, fnv1a(body, frameSeed(gen, offset)));
+  return out.bytes();
+}
+
+/**
+ * The records of a log built on snapshot `gen`, up to the first frame that
+ * does not verify; `null` when the log is empty, torn in its header, or
+ * built on another generation (or `gen` is `null`: no snapshot loaded).
+ * Throws `UnknownFormatError` for a header under a magic this version does
+ * not read, and for a frame that verifies but does not decode.
+ */
+export function decodeLog(
+  buffer: Uint8Array,
+  gen: number | null,
+): NsRecord[] | null {
+  if (buffer.byteLength >= 4) {
+    refuseEarlier(buffer, EARLIER_LOGS);
+    refuseForeignMagic(buffer, [LOG_MAGIC]);
+  }
+  if (buffer.byteLength < LOG_HEADER) return null;
+  const view = new DataView(
+    buffer.buffer,
+    buffer.byteOffset,
+    buffer.byteLength,
+  );
+  if (logHeaderCheck(buffer) !== view.getUint32(4, true)) return null;
+  if (!hasMagic(buffer, LOG_MAGIC)) {
+    throw new UnknownFormatError(`magic ${JSON.stringify(magicOf(buffer))}`);
+  }
+  if (gen === null) return null;
+  const [low, high] = splitGen(gen);
+  if (view.getUint32(8, true) !== low || view.getUint32(12, true) !== high) {
+    return null;
+  }
+  const records: NsRecord[] = [];
+  let offset = LOG_HEADER;
+  while (offset + FRAME_HEADER <= buffer.byteLength) {
+    const length = view.getUint32(offset, true);
+    const start = offset + FRAME_HEADER;
+    if (length === 0 || start + length > buffer.byteLength) break;
+    const body = buffer.subarray(start, start + length);
+    if (
+      fnv1a(body, frameSeed(gen, offset)) !== view.getUint32(offset + 4, true)
+    ) {
+      break;
+    }
+    try {
+      const input = new ByteReader(body);
+      const record = decodeRecord(input);
+      if (!input.done) throw new FormatError("bytes after the record");
+      records.push(record);
+    } catch (error) {
+      if (!(error instanceof FormatError)) throw error;
+      throw new UnknownFormatError(
+        `frame at offset ${offset}: ${error.message}`,
+      );
+    }
+    offset = start + length;
+  }
+  return records;
 }

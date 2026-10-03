@@ -53,7 +53,10 @@ namespace operations must update the live `DirectoryNode.entries` as well as any
 persistent record. They are not notifications after an independent core mutation.
 File identity is object identity; external storage need not use `FileNode.content`
 for bytes. Memory-only namespace helpers do not themselves persist changes. OPFS
-retains its existing seeded-file adoption on open and through `persistAll()`.
+adopts seeded files on open and through `persistAll()`. Other seeded files become
+durable only when the backend next writes a full snapshot (at compaction, the next
+`create()`, or a guest rename of a seeded name, which no log record could replay),
+so call `persistAll()` after seeding.
 
 In particular, calling `backend.fileSystem.removeEntry()` on a persisted OPFS
 file only changes the live memory tree. The durable mapping can still restore
@@ -124,8 +127,12 @@ pool exhaustion, metadata recovery, and destructive unlink ordering are unchange
 Memory storage keeps its existing capacity, zero-fill, aliasing, and resizable
 buffer behavior.
 
-Namespace changes serialize and flush the whole filename tree. This cost grows
-with namespace size and mutation frequency; it is not constant-cost metadata I/O.
+Each namespace change is recorded by appending one record to a change log and
+flushing it, so recording it costs amortized constant time, whatever the
+namespace size. Periodic compaction rewrites the whole filename tree, amortized
+over the changes that preceded it (see [Namespace Record](#namespace-record)).
+The syscall itself may still cost more than recording: renaming a directory
+searches its subtree, so that it is not moved into itself.
 
 Shutdown hardening removes a pending mapping when its materialization is
 cancelled by close, without dropping a newer mapping. This does not make guest
@@ -185,6 +192,48 @@ leaves a known magic or a zero byte, never that. The formats of earlier builds o
 this backend are refused the same way, by name: the JSON namespace under `"UWM1"`,
 and the binary one under `"UWS1"`, whose checksum covered the body alone.
 
-Every later format of these files must keep this header: a 4-byte magic first,
+Changes after a snapshot go to `.uwasi.meta.log`, one record per namespace change,
+appended and flushed before the syscall returns. The log header is
+`"UWL2" | u32 check | u64 generation`: it names the snapshot generation the log
+builds on, and its check is FNV-1a over the magic continued over the generation.
+As for a snapshot slot, a header that verifies under a magic this version does
+not know, or that has an unknown magic of four nonzero bytes, makes `create()`
+reject, and so does the `"UWL1"` log of earlier builds, whose check covered the
+generation alone. Each frame is `u32 body length | u32 check | record`, where the check is
+FNV-1a of the record seeded with the generation and the frame's offset, so bytes
+left over from an earlier generation, or from a frame at another offset, never
+verify. Re-init replays the log on top of the snapshot it names, stopping at the
+first frame that does not verify. A frame that verifies was written whole, so if
+it does not decode to exactly one record, `create()` rejects: stopping there
+would drop the changes after it for good, since every open compacts. A failed
+append is truncated away where possible. A complete frame left behind at the end
+of the log does verify, and may still become durable, so the failed change may
+take effect after all, which a failed syscall allows.
+
+Every later format of these files must keep their header: a 4-byte magic first,
 new for any change in format, and a checksum that covers it. That is what lets an
 older version tell a store it must refuse from one it may recover.
+
+Once the log exceeds both 64 KiB and twice the last snapshot, the backend writes
+the next snapshot and then resets the log to build on it. A crash between those
+steps leaves a log naming the older generation, which re-init ignores because the
+new snapshot already holds its changes. If the reset itself fails, changes are
+recorded by full snapshots until a later compaction resets the log. If the
+snapshot fails, the slot may still hold it, and storage may keep it however the
+write failed, with the same effect. Its generation is not used again in that
+session and the log takes no further appends, so changes are again recorded by
+full snapshots (into the same slot) until one succeeds and replaces it. Every
+`create()` also compacts, so a store opens with an empty log. It counts
+generations on from the one it loaded, which may reuse a failed snapshot's
+generation; that is harmless, since a slot it did not load is torn or older,
+and its first snapshot overwrites that slot.
+
+A failed change can thus leave a record that names a data file the backend has
+freed: the file whose content an unlink destroyed before recording the removal
+failed, or the file a failed create claimed. Such a data file stays out of the
+spare pool until a later snapshot succeeds, since a new file claiming it would
+make that name show the new file's bytes. A data file whose name a durable
+record already dropped, by an unlink or a replacing rename that succeeded, is
+reused at once: replay forgets it at that record. A directory `fd_sync` flushes
+nothing, since every guest change was flushed before its syscall returned; it
+does not record host-seeded files either (see `persistAll()`).
