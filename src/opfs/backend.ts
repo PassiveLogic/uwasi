@@ -236,7 +236,17 @@ export class OPFSBackend implements FSBackend {
     } = {},
   ): Promise<OPFSBackend> {
     const backend = new OPFSBackend(store, options.spareFiles ?? 16);
-    await backend.init(options.preopens);
+    try {
+      await backend.init(options.preopens);
+    } catch (error) {
+      // Sync access handles are exclusive locks: any left held would make
+      // every later attempt to open the store in this worker fail. Mark the
+      // backend closed first: background work the open queued may still be
+      // waiting on OPFS, and must release whatever it acquires afterwards.
+      backend.closed = true;
+      backend.releaseHandles();
+      throw error;
+    }
     return backend;
   }
 
@@ -292,9 +302,9 @@ export class OPFSBackend implements FSBackend {
     // Reclaim tombstones: destroy any leftover content, reuse as spares.
     for (const [id, fileHandle] of dataFiles) {
       const handle = await fileHandle.createSyncAccessHandle();
+      this.handleById.set(id, handle);
       handle.truncate(0);
       handle.flush();
-      this.handleById.set(id, handle);
       this.spares.push(id);
     }
 
@@ -311,7 +321,12 @@ export class OPFSBackend implements FSBackend {
       const id = this.spares.pop()!;
       this.handleById.get(id)!.close();
       this.handleById.delete(id);
-      await this.store.removeEntry(dataName(id));
+      try {
+        await this.store.removeEntry(dataName(id));
+      } catch {
+        // Best effort: the file is unreferenced, and the next open
+        // reclaims it again.
+      }
     }
 
     // Persist the initial state (also records the advanced id counter).
@@ -546,16 +561,40 @@ export class OPFSBackend implements FSBackend {
         // Then refill the spare pool.
         while (this.spares.length < this.spareTarget && !this.closed) {
           const id = this.nextId++;
-          const fileHandle = await this.store.getFileHandle(dataName(id), {
-            create: true,
-          });
-          const handle = await fileHandle.createSyncAccessHandle();
+          const handle = await this.openDataFile(id);
+          if (handle === undefined) return;
           this.handleById.set(id, handle);
           this.spares.push(id);
         }
       });
     // `settle()` and `close()` report a failure; nothing else awaits it.
     this.background.catch(() => {});
+  }
+
+  /**
+   * Acquire the sync access handle of data file `id`, creating the file if
+   * needed. Background work can outlive the backend - a failed `create()`
+   * releases every handle while work it queued still waits on OPFS - so a
+   * handle that arrives after shutdown is released at once, and nothing is
+   * returned in its place.
+   */
+  private async openDataFile(
+    id: number,
+  ): Promise<OPFSSyncAccessHandle | undefined> {
+    const fileHandle = await this.store.getFileHandle(dataName(id), {
+      create: true,
+    });
+    if (this.closed) return undefined;
+    const handle = await fileHandle.createSyncAccessHandle();
+    if (this.closed) {
+      try {
+        handle.close();
+      } catch {
+        // Already closed or revoked.
+      }
+      return undefined;
+    }
+    return handle;
   }
 
   /**
@@ -569,10 +608,8 @@ export class OPFSBackend implements FSBackend {
     let handle = this.handleById.get(id);
     const retry = handle !== undefined;
     if (handle === undefined) {
-      const fileHandle = await this.store.getFileHandle(dataName(id), {
-        create: true,
-      });
-      handle = await fileHandle.createSyncAccessHandle();
+      handle = await this.openDataFile(id);
+      if (handle === undefined) return;
       // Tracked at once, so a failure below leaves it for the next attempt
       // and for `close()` to release.
       this.handleById.set(id, handle);
@@ -717,20 +754,7 @@ export class OPFSBackend implements FSBackend {
     // A guest call during that wait may have overdrafted a file that no
     // round can give a data file any more.
     for (const node of this.pendingIds.keys()) lost.add(node);
-    for (const handle of this.handleById.values()) {
-      try {
-        handle.close();
-      } catch {
-        // Already closed or revoked; nothing left to release.
-      }
-    }
-    for (const handle of this.metaHandles) {
-      try {
-        handle.close();
-      } catch {
-        // Already closed or revoked; nothing left to release.
-      }
-    }
+    this.releaseHandles();
     // A failed attempt that could not empty its data file left part of a
     // lost file's content there, and closing the handle flushed it.
     // Remove those data files, so the next open recreates them empty
@@ -748,6 +772,16 @@ export class OPFSBackend implements FSBackend {
         failure ??
         new Error(`uwasi: ${lost.size} files lost their content at close`)
       );
+    }
+  }
+
+  private releaseHandles(): void {
+    for (const handle of [...this.handleById.values(), ...this.metaHandles]) {
+      try {
+        handle.close();
+      } catch {
+        // Already closed or revoked; nothing left to release.
+      }
     }
   }
 

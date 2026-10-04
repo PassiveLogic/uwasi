@@ -5,6 +5,7 @@ import { OPFSBackend } from "uwasi/opfs";
 import { MockOPFS } from "./opfs_mock.mjs";
 import {
   bindImports,
+  sysClose,
   sysCreate,
   sysOpen,
   sysStat,
@@ -95,6 +96,12 @@ describe("settle()", () => {
     await fresh.backend.close();
   });
 });
+
+function listNames(backend, path = "/") {
+  return backend
+    .listChildren(backend.fileSystem.lookup(path))
+    .filter((name) => name !== "dev");
+}
 
 describe("an allocated id is not a recorded name", () => {
   for (const spareFiles of [0, 2]) {
@@ -282,5 +289,100 @@ describe("failed background work is reported", () => {
     assert.strictEqual(opened.errno, ESUCCESS);
     assert.strictEqual(sysReadText(fresh.h, opened.fd).text, "");
     await fresh.backend.close();
+  });
+});
+
+describe("opening a store survives storage failures", () => {
+  for (const [what, fault] of [
+    ["the initial record write", { op: "write", match: ".uwasi.meta." }],
+    [
+      "a data file handle",
+      { op: "createSyncAccessHandle", match: ".uwasi.data.", nth: 2 },
+    ],
+  ]) {
+    it(`a create() failing at ${what} releases its handles`, async () => {
+      const store = new MockOPFS();
+      const first = await makeWorker(store, { spareFiles: 2 });
+      const kept = sysCreate(first.h, "keep");
+      assert.strictEqual(sysWrite(first.h, kept.fd, "kept").errno, ESUCCESS);
+      assert.strictEqual(sysSync(first.h, kept.fd), ESUCCESS);
+      store.simulateCrash();
+      const armed = store.injectFault(fault);
+      await assert.rejects(OPFSBackend.create(store.root, { spareFiles: 2 }));
+      assert.strictEqual(armed.fired, 1);
+      store.clearFaults();
+      // A retry in the same worker finds every lock free.
+      const retry = await makeWorker(store, { spareFiles: 2 });
+      const opened = sysOpen(retry.h, "keep");
+      assert.strictEqual(opened.errno, ESUCCESS);
+      assert.strictEqual(sysReadText(retry.h, opened.fd).text, "kept");
+      await retry.backend.close();
+    });
+  }
+
+  it("failing to remove surplus data files does not fail the open", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const names = ["g0", "g1", "g2", "g3"];
+    for (const name of names) {
+      const file = sysCreate(w.h, name);
+      assert.strictEqual(sysWrite(w.h, file.fd, name).errno, ESUCCESS);
+      await w.backend.settle();
+      assert.strictEqual(sysSync(w.h, file.fd), ESUCCESS);
+    }
+    for (const name of names.slice(1)) {
+      assert.strictEqual(sysUnlink(w.h, name), ESUCCESS);
+    }
+    store.simulateCrash();
+    // The unlinked files' data files are surplus at the next open.
+    const fault = store.injectFault({ op: "removeEntry", times: Infinity });
+    const reopened = await makeWorker(store, { spareFiles: 1 });
+    assert.ok(fault.fired > 0, "the open never removed a surplus data file");
+    assert.deepStrictEqual(listNames(reopened.backend), ["g0"]);
+    await reopened.backend.close();
+    store.clearFaults();
+    const again = await makeWorker(store, { spareFiles: 1 });
+    assert.deepStrictEqual(listNames(again.backend), ["g0"]);
+    const g0 = sysOpen(again.h, "g0");
+    assert.strictEqual(sysReadText(again.h, g0.fd).text, "g0");
+    await again.backend.close();
+  });
+
+  it("a failed create() leaves no lock behind, even from background work it queued", async () => {
+    const store = new MockOPFS();
+    const first = await makeWorker(store, { spareFiles: 1 });
+    const a = sysCreate(first.h, "a");
+    assert.strictEqual(sysWrite(first.h, a.fd, "A").errno, ESUCCESS);
+    assert.strictEqual(sysSync(first.h, a.fd), ESUCCESS);
+    assert.strictEqual(sysClose(first.h, a.fd), ESUCCESS);
+    // A failed unlink, then a create: depending on how the store treats
+    // the data file the unlink emptied, the reopen below may have a file
+    // to give a data file while it writes its first record, which queues
+    // background work - and that write fails.
+    const unlinkFault = store.injectFault({
+      op: "write",
+      match: ".uwasi.meta.",
+    });
+    assert.notStrictEqual(sysUnlink(first.h, "a"), ESUCCESS);
+    assert.strictEqual(unlinkFault.fired, 1);
+    assert.strictEqual(sysCreate(first.h, "b").errno, ESUCCESS);
+    store.simulateCrash();
+    const openFault = store.injectFault({ op: "write", match: /meta\.[01]$/ });
+    await assert.rejects(OPFSBackend.create(store.root, { spareFiles: 1 }));
+    assert.strictEqual(openFault.fired, 1);
+    store.clearFaults();
+    for (let i = 0; i < 4; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    for await (const [name, handle] of store.root.entries()) {
+      if (handle.kind !== "file") continue;
+      let access;
+      try {
+        access = await handle.createSyncAccessHandle();
+      } catch (error) {
+        assert.fail(`${name} is still locked: ${error.name}`);
+      }
+      access.close();
+    }
   });
 });
