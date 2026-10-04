@@ -768,16 +768,32 @@ export class OPFSBackend implements FSBackend {
   }
 
   /**
-   * Persist every file reachable in the tree, including ones seeded
-   * through the `MemoryFileSystem` tree-builder after `create()`. Being
-   * async it does not draw on the spare pool; call it after seeding to
-   * keep the pool free for the guest.
+   * Make every file reachable in the tree durable, name and content alike,
+   * including files seeded through the `MemoryFileSystem` tree-builder
+   * after `create()`: once it resolves, a crash keeps each one with the
+   * content it held then. Guest calls may run while it waits; it resolves
+   * once background work is quiescent (see `settle()`), and covers every
+   * file reachable at that point except files seeded while it waited. A
+   * guest that keeps creating files past the spare pool during every wait
+   * can delay that indefinitely. Being async it does not draw on the
+   * spare pool; call it after seeding to keep the pool free for the
+   * guest. Rejects if any of it failed.
    */
   async persistAll(): Promise<void> {
     const root = this.fileSystem.lookup("/") as DirectoryNode;
     await this.adoptSubtree(root);
     this.snapshotFlush();
-    await this.settle();
+    // A guest call may overdraft another file once `settle()` has resolved
+    // but before this resumes: settle again until none is pending. No
+    // await separates that check from the flush, so no guest call can
+    // slip in between.
+    do {
+      await this.settle();
+    } while (this.pendingIds.size > 0);
+    // Files that had a data file already may hold writes no flush has
+    // covered yet.
+    const failure = this.flushDataFiles();
+    if (failure !== undefined) throw failure;
   }
 
   private async adoptSubtree(dir: DirectoryNode): Promise<void> {

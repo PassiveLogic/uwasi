@@ -757,3 +757,102 @@ describe("a clean close", () => {
     assert.deepStrictEqual(flushed, []);
   });
 });
+
+describe("persistAll()", () => {
+  for (const spareFiles of [0, 1]) {
+    const kind = spareFiles === 0 ? "overdrafted" : "spare-backed";
+    it(`makes the current content of every file durable (${kind})`, async () => {
+      const store = new MockOPFS();
+      const w = await makeWorker(store, { spareFiles });
+      const f = sysCreate(w.h, "saved");
+      assert.strictEqual(sysWrite(w.h, f.fd, "first").errno, ESUCCESS);
+      await w.backend.settle();
+      // Written after the file got its data file, and never synced.
+      assert.strictEqual(sysWrite(w.h, f.fd, " second").errno, ESUCCESS);
+      w.backend.fileSystem.addFile("/seeded", "seed");
+      await w.backend.persistAll();
+      store.simulateCrash();
+      const fresh = await makeWorker(store);
+      for (const [name, text] of [
+        ["saved", "first second"],
+        ["seeded", "seed"],
+      ]) {
+        const opened = sysOpen(fresh.h, name);
+        assert.strictEqual(opened.errno, ESUCCESS, `open ${name}`);
+        assert.strictEqual(sysReadText(fresh.h, opened.fd).text, text);
+      }
+      await fresh.backend.close();
+    });
+  }
+
+  it("covers files created while it waits", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    // Crash the moment it resolves, before anything else can run.
+    const { started, late } = await createDuringAwaitedRound(store, w, () =>
+      w.backend.persistAll().then(() => store.simulateCrash()),
+    );
+    // Unless it waits for that round, it resolves, crashing the store,
+    // before the round can park.
+    await Promise.race([late.parked(1), started]);
+    late.release();
+    await started;
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    for (const name of ["a", "b", "c", "d"]) {
+      const opened = sysOpen(fresh.h, name);
+      assert.strictEqual(opened.errno, ESUCCESS, `open ${name}`);
+      assert.strictEqual(sysReadText(fresh.h, opened.fd).text, name);
+    }
+    await fresh.backend.close();
+  });
+
+  it("covers a file overdrafted after settle() resolves", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const late = store.holdAsync({
+      op: "createSyncAccessHandle",
+      match: ".uwasi.data.",
+    });
+    // Stand in for guest calls landing between settle() resolving and
+    // persistAll() resuming: "e" claims the spare, "f" goes past the pool.
+    const settle = w.backend.settle.bind(w.backend);
+    let created = false;
+    w.backend.settle = async () => {
+      await settle();
+      if (created) return;
+      created = true;
+      for (const name of ["e", "f"]) {
+        const file = sysCreate(w.h, name);
+        assert.strictEqual(sysWrite(w.h, file.fd, name).errno, ESUCCESS);
+      }
+    };
+    // Crash the moment it resolves, before anything else can run.
+    const started = w.backend.persistAll().then(() => store.simulateCrash());
+    // Unless it waits for that round, it resolves, crashing the store,
+    // before the round can park.
+    await Promise.race([late.parked(1), started]);
+    late.release();
+    await started;
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    for (const name of ["e", "f"]) {
+      const opened = sysOpen(fresh.h, name);
+      assert.strictEqual(opened.errno, ESUCCESS, `open ${name}`);
+      assert.strictEqual(sysReadText(fresh.h, opened.fd).text, name);
+    }
+    await fresh.backend.close();
+  });
+
+  it("rejects when a file's content cannot be flushed", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const f = sysCreate(w.h, "f");
+    assert.strictEqual(sysWrite(w.h, f.fd, "data").errno, ESUCCESS);
+    await w.backend.settle();
+    const fault = store.injectFault({ op: "flush", match: ".uwasi.data." });
+    await assert.rejects(w.backend.persistAll(), {
+      name: "QuotaExceededError",
+    });
+    assert.strictEqual(fault.fired, 1);
+    await w.backend.close();
+  });
+});
