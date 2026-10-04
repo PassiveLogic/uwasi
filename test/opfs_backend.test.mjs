@@ -698,6 +698,22 @@ describe("short and failed physical writes", () => {
     await w.backend.close();
   });
 
+  it("a spare returned after a failed adoption holds no partial content", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    w.backend.fileSystem.addFile("/seeded", "PARTIAL CONTENT");
+    const injected = store.injectShortWrite(".uwasi.data.", 7);
+    assert.strictEqual(sysOpen(w.h, "seeded").errno, WASIAbi.WASI_ERRNO_NOSPC);
+    assert.strictEqual(injected.fired, 1);
+    // The same spare backs the next file, with no I/O to clear it.
+    const { errno, fd } = sysCreate(w.h, "fresh");
+    assert.strictEqual(errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, fd), ESUCCESS, "backed by the spare");
+    assert.strictEqual(sysStat(w.h, "fresh").size, 0);
+    assert.strictEqual(sysReadText(w.h, fd).text, "");
+    await w.backend.close();
+  });
+
   it("persistAll rejects on a short write instead of silently dropping content", async () => {
     const store = new MockOPFS();
     const w = await makeWorker(store);

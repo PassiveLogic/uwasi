@@ -822,16 +822,24 @@ export class OPFSBackend implements FSBackend {
       this.scheduleBackground();
       return;
     }
-    const handle = this.handleById.get(id)!;
-    try {
-      handle.truncate(0);
-      if (node.content.byteLength > 0) {
+    // Spares are durably empty - every path into the pool creates the
+    // file or truncates and flushes it - so an empty node needs no I/O.
+    if (node.content.byteLength > 0) {
+      const handle = this.handleById.get(id)!;
+      try {
         writeFully(handle, node.content, 0);
+        handle.flush();
+      } catch (error) {
+        try {
+          // Keep the invariant before handing the spare back.
+          handle.truncate(0);
+          handle.flush();
+          this.spares.unshift(id);
+        } catch {
+          // Leave it out of the pool; re-init reclaims the data file.
+        }
+        throw error;
       }
-      handle.flush();
-    } catch (error) {
-      this.spares.unshift(id);
-      throw error;
     }
     this.physByNode.set(node, id);
     node.content = new Uint8Array(0);
