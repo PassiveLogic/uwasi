@@ -87,13 +87,15 @@ describe("MockOPFS semantics", () => {
     const store = new MockOPFS();
     const file = await store.root.getFileHandle("f", { create: true });
     const handle = await file.createSyncAccessHandle();
-    store.injectShortWrite("f", 2);
+    const injected = store.injectShortWrite("f", 2);
+    assert.strictEqual(injected.fired, 0);
     assert.strictEqual(
       handle.write(new Uint8Array([1, 2, 3, 4]), { at: 0 }),
       2,
     );
     // The injection is consumed; the next write is whole again.
     assert.strictEqual(handle.write(new Uint8Array([9, 9]), { at: 2 }), 2);
+    assert.strictEqual(injected.fired, 1);
     handle.close();
     assert.deepStrictEqual(Array.from(store.durableContent("f")), [1, 2, 9, 9]);
   });
@@ -103,7 +105,7 @@ describe("MockOPFS semantics", () => {
     const file = await store.root.getFileHandle("f", { create: true });
     const handle = await file.createSyncAccessHandle();
     handle.write(new Uint8Array([1, 2]), { at: 0 });
-    store.injectTruncateError("f");
+    const injected = store.injectTruncateError("f");
     assert.throws(
       () => handle.truncate(0),
       (err) => err.name === "QuotaExceededError",
@@ -111,7 +113,86 @@ describe("MockOPFS semantics", () => {
     // The failed truncate must not have touched the content.
     assert.strictEqual(handle.getSize(), 2);
     handle.truncate(0); // consumed: works again
+    assert.strictEqual(injected.fired, 1);
     handle.close();
+  });
+
+  it("simulateCrash can keep the unflushed work of the handles it picks", async () => {
+    const store = new MockOPFS();
+    const handles = {};
+    for (const name of ["kept", "lost"]) {
+      const file = await store.root.getFileHandle(name, { create: true });
+      handles[name] = await file.createSyncAccessHandle();
+      handles[name].write(new Uint8Array([1, 2, 3]), { at: 0 });
+      handles[name].flush();
+      handles[name].truncate(1);
+      handles[name].write(new Uint8Array([9]), { at: 4 });
+    }
+    const kept = store.simulateCrash({ persist: (path) => path === "/kept" });
+    assert.deepStrictEqual(kept, ["/kept"]);
+    assert.deepStrictEqual(
+      Array.from(store.durableContent("kept")),
+      [1, 0, 0, 0, 9],
+      "every unflushed write and truncate of a picked handle survives",
+    );
+    assert.deepStrictEqual(Array.from(store.durableContent("lost")), [1, 2, 3]);
+    // Locks are released either way.
+    for (const name of ["kept", "lost"]) {
+      const file = await store.root.getFileHandle(name);
+      (await file.createSyncAccessHandle()).close();
+    }
+  });
+
+  it("simulateCrash with a probability draws from the given random source", async () => {
+    const store = new MockOPFS();
+    for (const name of ["a", "b", "c"]) {
+      const file = await store.root.getFileHandle(name, { create: true });
+      const handle = await file.createSyncAccessHandle();
+      handle.write(new Uint8Array([7]), { at: 0 });
+    }
+    const draws = [0.1, 0.9, 0.4];
+    const kept = store.simulateCrash({
+      persist: 0.5,
+      random: () => draws.shift(),
+    });
+    assert.deepStrictEqual(kept, ["/a", "/c"]);
+    assert.deepStrictEqual(
+      ["a", "b", "c"].map((n) => store.durableContent(n).length),
+      [1, 0, 1],
+    );
+  });
+
+  it("closeFlushes: false makes close() only release; reopen or crash settles", async () => {
+    const write = async (store, name, bytes) => {
+      const file = await store.root.getFileHandle(name, { create: true });
+      const handle = await file.createSyncAccessHandle();
+      handle.write(new Uint8Array([1]), { at: 0 });
+      handle.flush();
+      handle.write(new Uint8Array(bytes), { at: 0 });
+      handle.close();
+    };
+    const read = async (store, name) => {
+      const file = await store.root.getFileHandle(name);
+      const handle = await file.createSyncAccessHandle();
+      const buffer = new Uint8Array(handle.getSize());
+      handle.read(buffer, { at: 0 });
+      handle.close();
+      return Array.from(buffer);
+    };
+    const dropping = new MockOPFS({ closeFlushes: false });
+    await write(dropping, "f", [7, 8]);
+    assert.deepStrictEqual(Array.from(dropping.durableContent("f")), [1]);
+    assert.deepStrictEqual(await read(dropping, "f"), [1], "dropped at reopen");
+
+    const keeping = new MockOPFS({
+      closeFlushes: false,
+      keepReleased: (path) => path === "/kept",
+    });
+    await write(keeping, "kept", [7, 8]);
+    await write(keeping, "lost", [7, 8]);
+    assert.deepStrictEqual(keeping.simulateCrash(), ["/kept"]);
+    assert.deepStrictEqual(Array.from(keeping.durableContent("kept")), [7, 8]);
+    assert.deepStrictEqual(Array.from(keeping.durableContent("lost")), [1]);
   });
 
   it("removeEntry refuses locked files and missing names", async () => {
@@ -128,6 +209,78 @@ describe("MockOPFS semantics", () => {
       () => store.root.removeEntry("f"),
       (err) => err.name === "NotFoundError",
     );
+  });
+
+  it("injectFault throws on the Nth match for K calls then disarms", async () => {
+    const store = new MockOPFS();
+    const file = await store.root.getFileHandle("f", { create: true });
+    const handle = await file.createSyncAccessHandle();
+    const fault = store.injectFault({
+      op: "write",
+      match: "f",
+      nth: 2,
+      times: 2,
+    });
+    const bytes = new Uint8Array([1]);
+    assert.strictEqual(handle.write(bytes, { at: 0 }), 1);
+    for (let i = 0; i < 2; i++) {
+      assert.throws(() => handle.write(bytes, { at: 1 }), {
+        name: "QuotaExceededError",
+      });
+    }
+    assert.strictEqual(handle.write(bytes, { at: 1 }), 1);
+    assert.strictEqual(fault.fired, 2);
+    assert.strictEqual(handle.getSize(), 2, "failed writes had no effect");
+  });
+
+  it("injectFault short writes and throwing flush/truncate/read/getSize", async () => {
+    const store = new MockOPFS();
+    const file = await store.root.getFileHandle("f", { create: true });
+    const handle = await file.createSyncAccessHandle();
+    store.injectFault({ op: "write", short: 1 });
+    assert.strictEqual(handle.write(new Uint8Array([7, 8, 9]), { at: 0 }), 1);
+    assert.strictEqual(handle.getSize(), 1);
+    for (const [op, call] of [
+      ["flush", () => handle.flush()],
+      ["truncate", () => handle.truncate(0)],
+      ["read", () => handle.read(new Uint8Array(1), { at: 0 })],
+      ["getSize", () => handle.getSize()],
+    ]) {
+      store.injectFault({ op, match: /f$/ });
+      assert.throws(call, { name: "QuotaExceededError" }, op);
+      call();
+    }
+    assert.strictEqual(store.durableContent("f").length, 1);
+  });
+
+  it("injectFault rejects async calls and holdAsync parks them", async () => {
+    const store = new MockOPFS();
+    store.injectFault({ op: "getFileHandle", error: "NotAllowedError" });
+    await assert.rejects(store.root.getFileHandle("g", { create: true }), {
+      name: "NotAllowedError",
+    });
+    assert.deepStrictEqual(store.rootNames(), []);
+    const file = await store.root.getFileHandle("g", { create: true });
+    store.injectFault({ op: "createSyncAccessHandle" });
+    await assert.rejects(file.createSyncAccessHandle(), {
+      name: "QuotaExceededError",
+    });
+    store.injectFault({ op: "removeEntry" });
+    await assert.rejects(store.root.removeEntry("g"));
+    assert.deepStrictEqual(store.rootNames(), ["g"]);
+
+    const gate = store.holdAsync({ op: "getFileHandle", match: "/h" });
+    let done = false;
+    const pending = store.root
+      .getFileHandle("h", { create: true })
+      .then(() => (done = true));
+    await store.root.getFileHandle("other", { create: true });
+    await gate.parked(1);
+    assert.strictEqual(done, false);
+    assert.ok(!store.rootNames().includes("h"), "parked call has no effect");
+    gate.release();
+    await pending;
+    assert.ok(store.rootNames().includes("h"));
   });
 });
 
@@ -372,24 +525,26 @@ describe("short and failed physical writes", () => {
     const w = await makeWorker(store);
     const { errno, fd } = sysCreate(w.h, "f");
     assert.strictEqual(errno, ESUCCESS);
-    store.injectShortWrite(".uwasi.data.", 1);
+    const injected = store.injectShortWrite(".uwasi.data.", 1);
     assert.strictEqual(
       sysWrite(w.h, fd, "hello").errno,
       WASIAbi.WASI_ERRNO_NOSPC,
       "a partial write must never report success",
     );
+    assert.strictEqual(injected.fired, 1);
     await w.backend.close();
   });
 
   it("a short write on the namespace record fails the create and rolls it back", async () => {
     const store = new MockOPFS();
     const w = await makeWorker(store);
-    store.injectShortWrite(".uwasi.meta.", 4);
+    const injected = store.injectShortWrite(".uwasi.meta.", 4);
     assert.strictEqual(
       sysCreate(w.h, "f").errno,
       WASIAbi.WASI_ERRNO_NOSPC,
       "an unrecorded create must not report success",
     );
+    assert.strictEqual(injected.fired, 1);
     assert.strictEqual(
       sysStat(w.h, "f").errno,
       WASIAbi.WASI_ERRNO_NOENT,
@@ -402,12 +557,13 @@ describe("short and failed physical writes", () => {
     const store = new MockOPFS();
     const w = await makeWorker(store);
     w.backend.fileSystem.addFile("/seeded", "content");
-    store.injectShortWrite(".uwasi.data.", 3);
+    const injected = store.injectShortWrite(".uwasi.data.", 3);
     assert.strictEqual(
       sysOpen(w.h, "seeded").errno,
       WASIAbi.WASI_ERRNO_NOSPC,
       "truncated adopted content must not open as if intact",
     );
+    assert.strictEqual(injected.fired, 1);
     await w.backend.close();
   });
 
@@ -415,8 +571,9 @@ describe("short and failed physical writes", () => {
     const store = new MockOPFS();
     const w = await makeWorker(store);
     w.backend.fileSystem.addFile("/seeded", "content");
-    store.injectShortWrite(".uwasi.data.", 3);
+    const injected = store.injectShortWrite(".uwasi.data.", 3);
     await assert.rejects(() => w.backend.persistAll(), /short write/);
+    assert.strictEqual(injected.fired, 1);
     await w.backend.close();
   });
 
@@ -424,8 +581,9 @@ describe("short and failed physical writes", () => {
     const store = new MockOPFS();
     const w = await makeWorker(store);
     putFile(w.h, "f", "data");
-    store.injectShortWrite(".uwasi.meta.", 4);
+    const injected = store.injectShortWrite(".uwasi.meta.", 4);
     assert.strictEqual(sysUnlink(w.h, "f"), WASIAbi.WASI_ERRNO_NOSPC);
+    assert.strictEqual(injected.fired, 1);
     // The unlink did not happen, so the name must still resolve. (Its
     // content may already have died - that is the documented crash
     // window of the unlink protocol, name -> empty file.)
@@ -439,12 +597,13 @@ describe("short and failed physical writes", () => {
     putFile(w.h, "f", "precious");
     const dataFile = findDataFileContaining(store, "precious");
     assert.ok(dataFile, "the synced content must be durable somewhere");
-    store.injectTruncateError(dataFile);
+    const injected = store.injectTruncateError(dataFile);
     assert.strictEqual(
       sysUnlink(w.h, "f"),
       WASIAbi.WASI_ERRNO_NOSPC,
       "unlink must fail cleanly when step 1 (content death) fails",
     );
+    assert.strictEqual(injected.fired, 1);
     const reopened = sysOpen(w.h, "f");
     assert.strictEqual(reopened.errno, ESUCCESS);
     assert.strictEqual(sysReadText(w.h, reopened.fd).text, "precious");
@@ -494,8 +653,9 @@ describe("atomic rename over an existing target", () => {
     // The replaced file's cleanup dies - equivalent to a crash between
     // the record flush and the tombstone. The rename must already be
     // safe: cleanup is not a durability point.
-    store.injectTruncateError(dstData);
+    const injected = store.injectTruncateError(dstData);
     assert.strictEqual(sysRename(w.h, "src", "dst"), ESUCCESS);
+    assert.strictEqual(injected.fired, 1, "the cleanup must have failed");
     store.simulateCrash();
 
     const w2 = await makeWorker(store);
