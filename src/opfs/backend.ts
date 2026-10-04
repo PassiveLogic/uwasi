@@ -507,6 +507,7 @@ export class OPFSBackend implements FSBackend {
       // may already have created. Open fds keep working on the in-memory
       // content.
       this.pendingIds.delete(node);
+      this.known.delete(node);
       this.recycleAbandoned(pendingId, mayBeNamed);
       return FSErrno.SUCCESS;
     }
@@ -923,10 +924,14 @@ export class OPFSBackend implements FSBackend {
           return FSErrno.NOSPC;
         }
         const id = this.physByNode.get(node);
-        // No id and not pending: a tree-builder-seeded file that was
-        // never adopted - nothing durable was promised yet, so there is
-        // nothing to flush.
-        if (id !== undefined) this.handleById.get(id)!.flush();
+        if (id === undefined) {
+          // No data file and no pending id. A file no record names (seeded
+          // through the tree-builder and never adopted, or unlinked) was
+          // promised nothing, so there is nothing to flush. A named one
+          // has nowhere durable for its content: never report success.
+          return this.known.has(node) ? FSErrno.NOSPC : FSErrno.SUCCESS;
+        }
+        this.handleById.get(id)!.flush();
       }
       // A directory needs nothing: every namespace change flushed its
       // record before its syscall returned. Flushing the slots again could
@@ -1020,7 +1025,12 @@ export class OPFSBackend implements FSBackend {
 
   removeChild(parent: DirectoryNode, name: string): number {
     const node = parent.entries[name];
-    if (node !== undefined && node.type === "file") {
+    // A file past the spare pool has nothing durable to destroy, and must
+    // keep its id - which the record still names - if step 2 fails. Its
+    // id is released once the removal is durable.
+    const pending =
+      node !== undefined && node.type === "file" && this.pendingIds.has(node);
+    if (node !== undefined && node.type === "file" && !pending) {
       // Step 1: destroy the content durably, or defer that to the last
       // close while fds are open, before the unlink itself becomes
       // durable in step 2. If this fails, the name keeps resolving. Until
@@ -1043,6 +1053,7 @@ export class OPFSBackend implements FSBackend {
       }
       return this.errnoOf(error);
     }
+    if (pending) this.tombstone(node as FileNode, false);
     return FSErrno.SUCCESS;
   }
 

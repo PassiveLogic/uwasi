@@ -519,3 +519,47 @@ describe("a data file a record may still name is not reused", () => {
     assert.ok(text === null || text === "", `b shows ${text}`);
   });
 });
+
+describe("a failed unlink of a file past the spare pool", () => {
+  // The file has an open fd and no data file yet when its unlink fails to
+  // record the removal, so the record still names its pending id.
+  async function failedUnlinkOfPendingOpenFile() {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    assert.strictEqual(sysCreate(w.h, "filler").errno, ESUCCESS);
+    const file = sysCreate(w.h, "victim");
+    assert.strictEqual(file.errno, ESUCCESS);
+    const fault = store.injectFault({ op: "write", match: ".uwasi.meta." });
+    assert.notStrictEqual(sysUnlink(w.h, "victim"), ESUCCESS);
+    assert.strictEqual(fault.fired, 1);
+    assert.strictEqual(sysWrite(w.h, file.fd, "IMPORTANT").errno, ESUCCESS);
+    return { store, ...w, fd: file.fd };
+  }
+
+  it("fd_sync refuses until the file has its data file", async () => {
+    const { h, fd, backend } = await failedUnlinkOfPendingOpenFile();
+    assert.strictEqual(sysSync(h, fd), WASIAbi.WASI_ERRNO_NOSPC);
+    await backend.close();
+  });
+
+  it("settle() then fd_sync makes its content durable", async () => {
+    const { store, h, fd, backend } = await failedUnlinkOfPendingOpenFile();
+    await backend.settle();
+    assert.strictEqual(sysSync(h, fd), ESUCCESS);
+    store.simulateCrash();
+    assert.strictEqual(
+      await readAfterReopen(store, "victim", { spareFiles: 1 }),
+      "IMPORTANT",
+    );
+  });
+
+  it("a clean close keeps its content", async () => {
+    const { store, h, fd, backend } = await failedUnlinkOfPendingOpenFile();
+    assert.strictEqual(sysClose(h, fd), ESUCCESS);
+    await backend.close();
+    assert.strictEqual(
+      await readAfterReopen(store, "victim", { spareFiles: 1 }),
+      "IMPORTANT",
+    );
+  });
+});
