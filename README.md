@@ -213,7 +213,9 @@ push them to storage. Creating files is synchronous thanks to a pool of
 pre-created spares (`spareFiles` option, default 16); a burst that creates
 more files than that stays correct but defers content durability until the
 event loop turns (`fd_sync` fails honestly with `NOSPC` until then, and
-`await backend.settle()` catches the pool up). Hard links return `NOTSUP`.
+`await backend.settle()` catches the pool up). Hard links return `NOTSUP`,
+as do linking, renaming, replacing and unlinking device nodes such as
+`/dev/null`, which the runtime recreates at every open.
 
 ### Custom storage backends
 
@@ -244,8 +246,8 @@ is provided by `useMemoryFS` (in-memory) and `useOPFS` (durable, browser
 workers), both validated against the full
 [wasi-testsuite](https://github.com/WebAssembly/wasi-testsuite) with zero
 skipped cases using the in-memory backend and an OPFS mock, not a real browser
-(`useOPFS` differs only in refusing hard links with
-`NOTSUP`); `useStdio` provides the stdio subset only.
+(`useOPFS` differs only in refusing hard links and changes to device nodes
+with `NOTSUP`); `useStdio` provides the stdio subset only.
 
 | Syscall | Status | Notes |
 |-------|----------|---------|

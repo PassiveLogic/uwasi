@@ -110,7 +110,9 @@ make such an alias resolvable by Node or a browser.
 
 The OPFS on-disk metadata and data-file formats are unchanged. Sync access handles
 still require a worker and exclusive ownership by one live backend. Hard links
-remain unsupported; inode numbers and timestamps are not persisted. Async startup,
+remain unsupported, and so are links, renames and unlinks of device nodes such
+as `/dev/null`, which the runtime recreates at every open; both return `NOTSUP`.
+Inode numbers and timestamps are not persisted. Async startup,
 spare-handle pooling, pending file materialization, `settle()`, sync errors during
 pool exhaustion, metadata recovery, and destructive unlink ordering are unchanged.
 Memory storage keeps its existing capacity, zero-fill, aliasing, and resizable

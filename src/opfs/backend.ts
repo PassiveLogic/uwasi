@@ -138,6 +138,23 @@ function resizedContent(data: Uint8Array, size: number): Uint8Array | null {
 }
 
 /**
+ * Whether a namespace change naming `node` involves a device node: the
+ * node is one, or is a directory holding one (`/dev`). Device nodes belong
+ * to the runtime: the `MemoryFileSystem` constructor creates them at every
+ * open and no record stores them, so such a change would quietly come
+ * undone at a later open. The backend refuses it instead.
+ */
+function involvesDevice(node: FSNode | undefined): boolean {
+  if (node === undefined) return false;
+  if (node.type === "character") return true;
+  if (node.type !== "dir") return false;
+  for (const name in node.entries) {
+    if (node.entries[name].type === "character") return true;
+  }
+  return false;
+}
+
+/**
  * Write all of `data` at `at`. OPFS reports partial writes (e.g. under
  * quota pressure) only through the return value; a short write must never
  * pass as success, so it becomes a `RangeError` - which `errnoOf` maps to
@@ -190,9 +207,10 @@ function writeFully(
  * Re-init rebuilds the namespace from the record alone, so unreferenced
  * data files are reclaimed rather than resurrected.
  *
- * Limits: hard links are refused with `NOTSUP`, inode numbers and
- * timestamps are not persisted, and the store needs exactly one live
- * backend, since sync access handles are exclusive locks.
+ * Limits: hard links are refused with `NOTSUP`, as are changes naming a
+ * device node (see `involvesDevice`), inode numbers and timestamps are
+ * not persisted, and the store needs exactly one live backend, since sync
+ * access handles are exclusive locks.
  */
 export class OPFSBackend implements FSBackend {
   /**
@@ -1027,6 +1045,8 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   createChild(parent: DirectoryNode, name: string, node: FSNode): number {
+    // `path_link` of a device node.
+    if (involvesDevice(node)) return FSErrno.NOTSUP;
     if (
       (node.type !== "dir" && node.nlink > 1) ||
       (node.type === "file" &&
@@ -1060,6 +1080,7 @@ export class OPFSBackend implements FSBackend {
 
   removeChild(parent: DirectoryNode, name: string): number {
     const node = parent.entries[name];
+    if (involvesDevice(node)) return FSErrno.NOTSUP;
     // A file past the spare pool has nothing durable to destroy, and must
     // keep its id - which the record still names - if step 2 fails. Its
     // id is released once the removal is durable.
@@ -1100,6 +1121,9 @@ export class OPFSBackend implements FSBackend {
   ): number {
     const node = fromParent.entries[fromName];
     const replaced = toParent.entries[toName];
+    if (involvesDevice(node) || involvesDevice(replaced)) {
+      return FSErrno.NOTSUP;
+    }
     try {
       // Record the new mapping first, so that a crash here shows either
       // the old target or the renamed node at the destination, never a

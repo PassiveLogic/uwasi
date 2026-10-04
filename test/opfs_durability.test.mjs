@@ -7,6 +7,7 @@ import { MockOPFS } from "./opfs_mock.mjs";
 import {
   bindImports,
   sysClose,
+  sysLink,
   sysCreate,
   sysMkdir,
   sysOpen,
@@ -649,5 +650,47 @@ describe("sizes no buffer can hold, on a file without a data file", () => {
       WASIAbi.WASI_ERRNO_NOSPC,
     );
     await w.backend.close();
+  });
+});
+
+describe("device nodes", () => {
+  // /dev/null is recreated at every open and no record stores it, so a
+  // change to it or under its name could not survive a reopen.
+  const NOTSUP = WASIAbi.WASI_ERRNO_NOTSUP;
+
+  it("refuses to link, rename, replace or unlink them", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    assert.strictEqual(sysClose(w.h, sysCreate(w.h, "f").fd), ESUCCESS);
+    assert.strictEqual(sysLink(w.h, "dev/null", "nul"), NOTSUP);
+    assert.strictEqual(sysRename(w.h, "dev/null", "moved"), NOTSUP);
+    assert.strictEqual(sysRename(w.h, "f", "dev/null"), NOTSUP);
+    assert.strictEqual(sysUnlink(w.h, "dev/null"), NOTSUP);
+    assert.strictEqual(sysRename(w.h, "dev", "devices"), NOTSUP);
+    const expect = (backend) => {
+      assert.deepStrictEqual(listNames(backend), ["f"]);
+      assert.deepStrictEqual(listNames(backend, "/dev"), ["null"]);
+      assert.strictEqual(
+        backend.fileSystem.lookup("/dev/null").type,
+        "character",
+      );
+    };
+    expect(w.backend);
+    // Twice: a change can last one reopen and vanish at the next.
+    for (let i = 0; i < 2; i++) {
+      store.simulateCrash();
+      const fresh = await makeWorker(store, { spareFiles: 2 });
+      expect(fresh.backend);
+    }
+  });
+
+  it("still allows files of their own in /dev", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    assert.strictEqual(sysClose(w.h, sysCreate(w.h, "dev/f").fd), ESUCCESS);
+    assert.strictEqual(sysRename(w.h, "dev/f", "dev/g"), ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store, { spareFiles: 2 });
+    assert.deepStrictEqual(listNames(fresh.backend, "/dev"), ["null", "g"]);
   });
 });
