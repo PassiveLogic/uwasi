@@ -5,10 +5,13 @@ import { OPFSBackend } from "uwasi/opfs";
 import { MockOPFS } from "./opfs_mock.mjs";
 import {
   bindImports,
+  sysCreate,
   sysOpen,
   sysStat,
   sysSync,
   sysReadText,
+  sysUnlink,
+  sysWrite,
 } from "./syscall_harness.mjs";
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -19,6 +22,79 @@ async function makeWorker(store, options = {}) {
   const backend = await OPFSBackend.create(store.root, options);
   return { backend, h: bindImports(backend, backend.fileSystem) };
 }
+
+/**
+ * With `spareFiles: 1`, call `start()` while a background round is queued,
+ * and drive the round it waits for into its spare refill. Meanwhile the
+ * guest creates files "a" to "d", each holding its own name; the last
+ * one, "d", is created past the pool after the next round is already
+ * queued, so only that next round gives it a data file. That round waits
+ * on the returned gate. Returns what `start()` returned and the gate.
+ */
+async function createDuringAwaitedRound(store, w, start) {
+  const hold = () =>
+    store.holdAsync({ op: "createSyncAccessHandle", match: ".uwasi.data." });
+  const create = (name) => {
+    const file = sysCreate(w.h, name);
+    assert.strictEqual(file.errno, ESUCCESS, `create ${name}`);
+    assert.strictEqual(sysWrite(w.h, file.fd, name).errno, ESUCCESS);
+  };
+  // "a" claims the only spare, and the round refilling the pool stalls.
+  const refill = hold();
+  create("a");
+  await refill.parked(1);
+  // Queued behind that round, so it waits for the next one.
+  const started = start();
+  await new Promise((resolve) => setImmediate(resolve));
+  // "b" goes past the pool, so the awaited round materializes it first.
+  const materialize = hold();
+  create("b");
+  refill.release();
+  await materialize.parked(1);
+  // "c" claims the refilled spare, which queues another round.
+  create("c");
+  const refillAgain = hold();
+  materialize.release();
+  await refillAgain.parked(1);
+  // The awaited round is refilling now: "d" goes past the pool, and only
+  // the queued round can give it a data file.
+  const late = hold();
+  create("d");
+  refillAgain.release();
+  return { started, late };
+}
+
+describe("settle()", () => {
+  it("waits for background work queued while it waits", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const { started, late } = await createDuringAwaitedRound(store, w, () =>
+      w.backend.settle().then(() => sysSync(w.h, sysOpen(w.h, "d").fd)),
+    );
+    await late.parked(1);
+    late.release();
+    // Once it resolves, every file it covers has a data file to sync.
+    assert.strictEqual(await started, ESUCCESS);
+    await w.backend.close();
+  });
+
+  it("close() saves files created while it waits", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const { started, late } = await createDuringAwaitedRound(store, w, () =>
+      w.backend.close(),
+    );
+    late.release();
+    await started;
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    for (const name of ["a", "b", "c", "d"]) {
+      const opened = sysOpen(fresh.h, name);
+      assert.strictEqual(opened.errno, ESUCCESS, `open ${name}`);
+      assert.strictEqual(sysReadText(fresh.h, opened.fd).text, name);
+    }
+    await fresh.backend.close();
+  });
+});
 
 describe("an allocated id is not a recorded name", () => {
   for (const spareFiles of [0, 2]) {
@@ -43,4 +119,168 @@ describe("an allocated id is not a recorded name", () => {
       await fresh.backend.close();
     });
   }
+});
+
+describe("failed background work is reported", () => {
+  it("settle reports a failed pending materialization", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(sysWrite(w.h, file.fd, "payload").errno, ESUCCESS);
+    const injected = store.injectShortWrite(".uwasi.data.", 2);
+    await assert.rejects(w.backend.settle());
+    assert.strictEqual(injected.fired, 1);
+    await w.backend.close();
+  });
+
+  it("a later settle retries and makes every pending file durable", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const a = sysCreate(w.h, "a");
+    assert.strictEqual(
+      sysWrite(w.h, a.fd, "a longer first payload").errno,
+      ESUCCESS,
+    );
+    const b = sysCreate(w.h, "b");
+    assert.strictEqual(sysWrite(w.h, b.fd, "bbb").errno, ESUCCESS);
+    // The first attempt acquires a's handle, then writes only part of it.
+    const injected = store.injectShortWrite(".uwasi.data.", 2);
+    await assert.rejects(w.backend.settle());
+    assert.strictEqual(injected.fired, 1);
+    assert.notStrictEqual(sysSync(w.h, a.fd), ESUCCESS, "a is still pending");
+    // Pending content stays live in memory, and may shrink meanwhile.
+    assert.strictEqual(w.h.imports.fd_filestat_set_size(a.fd, 5n), ESUCCESS);
+    await w.backend.settle();
+    assert.strictEqual(sysSync(w.h, a.fd), ESUCCESS);
+    assert.strictEqual(sysSync(w.h, b.fd), ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    for (const [name, text] of [
+      ["a", "a lon"],
+      ["b", "bbb"],
+    ]) {
+      const opened = sysOpen(fresh.h, name);
+      assert.strictEqual(opened.errno, ESUCCESS);
+      assert.strictEqual(sysReadText(fresh.h, opened.fd).text, text);
+    }
+    await fresh.backend.close();
+  });
+
+  it("unlinking a file whose materialization failed recycles its handle", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(sysWrite(w.h, file.fd, "payload").errno, ESUCCESS);
+    // The attempt acquires the data file's handle, then fails to write.
+    const injected = store.injectShortWrite(".uwasi.data.", 2);
+    await assert.rejects(w.backend.settle());
+    assert.strictEqual(injected.fired, 1);
+    assert.strictEqual(sysUnlink(w.h, "pending"), ESUCCESS);
+    // The cancelled file is never retried; its emptied data file backs the
+    // next file at once, rather than staying locked until close.
+    const next = sysCreate(w.h, "next");
+    assert.strictEqual(sysSync(w.h, next.fd), ESUCCESS);
+    assert.strictEqual(sysReadText(w.h, next.fd).text, "");
+    await w.backend.close();
+  });
+
+  it("settle reports a failed spare refill and retries it", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    sysCreate(w.h, "claims-the-spare");
+    const fault = store.injectFault({
+      op: "createSyncAccessHandle",
+      match: ".uwasi.data.",
+    });
+    await assert.rejects(w.backend.settle());
+    assert.strictEqual(fault.fired, 1);
+    await w.backend.settle();
+    // The refilled spare backs the next file, so it syncs at once.
+    const next = sysCreate(w.h, "next");
+    assert.strictEqual(sysSync(w.h, next.fd), ESUCCESS);
+    await w.backend.close();
+  });
+
+  it("close rejects when pending content cannot be saved, releasing every handle", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(sysWrite(w.h, file.fd, "payload").errno, ESUCCESS);
+    const fault = store.injectFault({
+      op: "write",
+      match: ".uwasi.data.",
+      times: Infinity,
+    });
+    await assert.rejects(w.backend.close());
+    assert.ok(fault.fired > 0);
+    store.clearFaults();
+    // Every lock is released: the store opens again in the same worker.
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    assert.strictEqual(sysStat(fresh.h, "pending").errno, ESUCCESS);
+    await fresh.backend.close();
+  });
+
+  for (const truncateFails of [false, true]) {
+    const how = truncateFails ? ", even if it cannot be emptied" : "";
+    it(`a file close() reports lost never comes back holding part of its content${how}`, async () => {
+      const store = new MockOPFS();
+      const w = await makeWorker(store, { spareFiles: 0 });
+      const file = sysCreate(w.h, "pending");
+      assert.strictEqual(sysWrite(w.h, file.fd, "payload").errno, ESUCCESS);
+      // Every attempt to give it a data file stops after one byte.
+      const short = store.injectFault({
+        op: "write",
+        match: ".uwasi.data.",
+        short: 1,
+        times: Infinity,
+      });
+      const truncate = truncateFails
+        ? store.injectFault({
+            op: "truncate",
+            match: ".uwasi.data.",
+            times: Infinity,
+          })
+        : null;
+      await assert.rejects(w.backend.close());
+      assert.ok(short.fired > 0);
+      if (truncate !== null) assert.ok(truncate.fired > 0);
+      store.clearFaults();
+      const fresh = await makeWorker(store, { spareFiles: 0 });
+      const opened = sysOpen(fresh.h, "pending");
+      assert.strictEqual(opened.errno, ESUCCESS);
+      assert.strictEqual(sysReadText(fresh.h, opened.fd).text, "");
+      await fresh.backend.close();
+    });
+  }
+
+  it("a failed attempt empties its data file, so a failed removal at close leaks no prefix", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(
+      sysWrite(w.h, file.fd, "secret payload").errno,
+      ESUCCESS,
+    );
+    store.injectFault({
+      op: "write",
+      match: ".uwasi.data.",
+      short: 3,
+      times: Infinity,
+    });
+    // close() cannot remove the data file either, so only emptying it
+    // after each failed write keeps the prefix out.
+    store.injectFault({
+      op: "removeEntry",
+      match: ".uwasi.data.",
+      times: Infinity,
+    });
+    await assert.rejects(w.backend.settle());
+    await assert.rejects(w.backend.close());
+    store.clearFaults();
+    const fresh = await makeWorker(store, { spareFiles: 0 });
+    const opened = sysOpen(fresh.h, "pending");
+    assert.strictEqual(opened.errno, ESUCCESS);
+    assert.strictEqual(sysReadText(fresh.h, opened.fd).text, "");
+    await fresh.backend.close();
+  });
 });

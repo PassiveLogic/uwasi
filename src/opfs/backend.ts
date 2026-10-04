@@ -278,8 +278,9 @@ export class OPFSBackend implements FSBackend {
     for (const [, id] of this.physByNode) {
       let fileHandle = dataFiles.get(id);
       if (!fileHandle) {
-        // Referenced but physically missing (a foreign actor removed it):
-        // surface it as an empty file rather than failing the whole store.
+        // Referenced but physically missing (a foreign actor removed it,
+        // or `close()` did for a file it reported lost): surface it as an
+        // empty file rather than failing the whole store.
         fileHandle = await this.store.getFileHandle(dataName(id), {
           create: true,
         });
@@ -450,11 +451,14 @@ export class OPFSBackend implements FSBackend {
    * Returns an errno; on failure nothing is recycled.
    */
   private tombstone(node: FileNode): number {
-    if (this.pendingIds.delete(node)) {
+    const pendingId = this.pendingIds.get(node);
+    if (pendingId !== undefined) {
       // Never materialized: nothing durable exists to destroy, and the
       // materializer will notice the cancellation and recycle the file it
       // may already have created. Open fds keep working on the in-memory
       // content.
+      this.pendingIds.delete(node);
+      this.recycleAbandoned(pendingId);
       return FSErrno.SUCCESS;
     }
     if (!this.physByNode.has(node)) return FSErrno.SUCCESS;
@@ -463,6 +467,31 @@ export class OPFSBackend implements FSBackend {
       return FSErrno.SUCCESS;
     }
     return this.destroyContent(node);
+  }
+
+  /**
+   * A failed materialization leaves its handle tracked for the retry, but
+   * a cancelled id is never retried, so recycle that handle here. (An
+   * attempt still acquiring one has not tracked it yet, and recycles it
+   * itself.)
+   */
+  private recycleAbandoned(id: number): void {
+    const handle = this.handleById.get(id);
+    if (handle === undefined) return;
+    try {
+      handle.truncate(0);
+      handle.flush();
+      this.spares.push(id);
+    } catch {
+      // It may still hold content, so it cannot be a spare. Release its
+      // lock instead; re-init reclaims the unreferenced data file.
+      this.handleById.delete(id);
+      try {
+        handle.close();
+      } catch {
+        // Already closed or revoked.
+      }
+    }
   }
 
   private destroyContent(node: FileNode): number {
@@ -488,39 +517,32 @@ export class OPFSBackend implements FSBackend {
   private scheduleBackground(): void {
     if (this.replenishScheduled || this.closed) return;
     this.replenishScheduled = true;
+    // A round starts even after a failed one: it retries whatever that
+    // round left undone.
     this.background = this.background
+      .catch(() => {})
       .then(async () => {
         this.replenishScheduled = false;
         // Materialize overdrafted files first: each waits on a durability
-        // guarantee (`sync` fails until its physical file exists).
-        while (this.pendingIds.size > 0) {
-          const [node, id] = this.pendingIds.entries().next().value as [
-            FileNode,
-            number,
-          ];
-          const fileHandle = await this.store.getFileHandle(dataName(id), {
-            create: true,
-          });
-          const handle = await fileHandle.createSyncAccessHandle();
-          if (this.pendingIds.get(node) !== id || this.closed) {
-            // Unlinked (or shut down) while we were acquiring the handle:
-            // recycle the physical file as a spare.
-            handle.truncate(0);
-            handle.flush();
-            this.handleById.set(id, handle);
-            this.spares.push(id);
-            if (this.pendingIds.get(node) === id) this.pendingIds.delete(node);
-            continue;
+        // guarantee (`sync` fails until its physical file exists). One
+        // failure does not hold the others back.
+        const failures: unknown[] = [];
+        const tried = new Set<FileNode>();
+        for (;;) {
+          const batch = [...this.pendingIds].filter(
+            ([node]) => !tried.has(node),
+          );
+          if (batch.length === 0) break;
+          for (const [node, id] of batch) {
+            tried.add(node);
+            try {
+              await this.materialize(node, id);
+            } catch (error) {
+              failures.push(error);
+            }
           }
-          if (node.content.byteLength > 0) {
-            writeFully(handle, node.content, 0);
-          }
-          handle.flush();
-          this.handleById.set(id, handle);
-          this.pendingIds.delete(node);
-          this.physByNode.set(node, id);
-          node.content = new Uint8Array(0);
         }
+        if (failures.length > 0) throw failures[0];
         // Then refill the spare pool.
         while (this.spares.length < this.spareTarget && !this.closed) {
           const id = this.nextId++;
@@ -531,10 +553,61 @@ export class OPFSBackend implements FSBackend {
           this.handleById.set(id, handle);
           this.spares.push(id);
         }
-      })
-      .catch(() => {
-        // Best effort: the pool just stays smaller until the next attempt.
       });
+    // `settle()` and `close()` report a failure; nothing else awaits it.
+    this.background.catch(() => {});
+  }
+
+  /**
+   * Give an overdrafted file its physical data file. A handle left by an
+   * earlier failed attempt is reused: it still holds the file's exclusive
+   * lock, so acquiring another would fail.
+   */
+  private async materialize(node: FileNode, id: number): Promise<void> {
+    // Unlinked before its turn: `tombstone` recycled any handle it had.
+    if (this.pendingIds.get(node) !== id) return;
+    let handle = this.handleById.get(id);
+    const retry = handle !== undefined;
+    if (handle === undefined) {
+      const fileHandle = await this.store.getFileHandle(dataName(id), {
+        create: true,
+      });
+      handle = await fileHandle.createSyncAccessHandle();
+      // Tracked at once, so a failure below leaves it for the next attempt
+      // and for `close()` to release.
+      this.handleById.set(id, handle);
+    }
+    if (this.pendingIds.get(node) !== id || this.closed) {
+      // Unlinked (or shut down) while we were acquiring the handle:
+      // recycle the physical file as a spare.
+      if (this.pendingIds.get(node) === id) this.pendingIds.delete(node);
+      this.recycleAbandoned(id);
+      return;
+    }
+    try {
+      if (node.content.byteLength > 0) {
+        writeFully(handle, node.content, 0);
+      }
+      // An earlier attempt may have written more than the content now holds.
+      if (retry) handle.truncate(node.content.byteLength);
+      handle.flush();
+    } catch (error) {
+      try {
+        // A failed write may leave part of the content in the file, and
+        // `close()` flushes every handle it releases. Empty the file, so no
+        // later flush publishes a prefix the file never held as a whole;
+        // the content stays in memory for the retry.
+        handle.truncate(0);
+      } catch {
+        // Then a later flush, or the storage itself before a crash, may
+        // still publish that prefix; `close()` removes the data file of a
+        // file it reports lost.
+      }
+      throw error;
+    }
+    this.pendingIds.delete(node);
+    this.physByNode.set(node, id);
+    node.content = new Uint8Array(0);
   }
 
   private errnoOf(error: unknown): number {
@@ -549,9 +622,30 @@ export class OPFSBackend implements FSBackend {
   // Public lifecycle helpers
   // -------------------------------------------------------------------
 
-  /** Wait for background work (spare-pool refills) to finish. */
+  /**
+   * Wait until background work is quiescent - no round scheduled or
+   * running, no file waiting for its data file - so files created past
+   * the spare pool have their data files, and the pool is refilled.
+   * Guest calls may run while it waits, and it waits for the work they
+   * queue too: no file reachable when it resolves still waits for its
+   * data file. A guest that keeps creating files past the pool during
+   * every wait can delay that indefinitely. Rejects as soon as a round
+   * fails; the files it left overdrafted keep their content in memory,
+   * and the next `settle()` (or file creation) retries.
+   */
   async settle(): Promise<void> {
-    await this.background;
+    // A fresh round retries what an earlier failed one left, rather than
+    // reporting its stale failure.
+    this.scheduleBackground();
+    for (;;) {
+      const round = this.background;
+      await round;
+      // A guest call during the wait queued another round: wait for it.
+      if (this.background !== round) continue;
+      // Only a closed backend leaves files pending after a clean round.
+      if (this.pendingIds.size === 0 || this.closed) return;
+      this.scheduleBackground();
+    }
   }
 
   /**
@@ -594,14 +688,35 @@ export class OPFSBackend implements FSBackend {
     }
   }
 
-  /** Flush and release every handle; the backend is unusable afterwards. */
+  /**
+   * Flush and release every handle; the backend is unusable afterwards.
+   * Rejects, once everything is released, if a file created past the
+   * spare pool still could not get its data file: its name is recorded,
+   * but the content it held only in memory is lost.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
-    // Let pending materializations and refills finish first, so files
-    // created past the spare pool become durable on a clean shutdown.
-    await this.background.catch(() => {});
+    // Let pending materializations and refills finish first (retrying any
+    // that failed), so files created past the spare pool become durable on
+    // a clean shutdown. Settling again if a guest call overdrafted a file
+    // after `settle()` resolved means only a failure loses content.
+    let failure: unknown = undefined;
+    do {
+      failure = await this.settle().then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    } while (failure === undefined && this.pendingIds.size > 0);
+    const lost = new Set(this.pendingIds.keys());
+    // Data files that failed attempts acquired for the files lost.
+    const abandoned = [...this.pendingIds.values()].filter((id) =>
+      this.handleById.has(id),
+    );
     this.closed = true;
     await this.background.catch(() => {});
+    // A guest call during that wait may have overdrafted a file that no
+    // round can give a data file any more.
+    for (const node of this.pendingIds.keys()) lost.add(node);
     for (const handle of this.handleById.values()) {
       try {
         handle.close();
@@ -615,6 +730,24 @@ export class OPFSBackend implements FSBackend {
       } catch {
         // Already closed or revoked; nothing left to release.
       }
+    }
+    // A failed attempt that could not empty its data file left part of a
+    // lost file's content there, and closing the handle flushed it.
+    // Remove those data files, so the next open recreates them empty
+    // rather than showing a prefix the file never held. Best effort: if
+    // the removal fails, or a crash comes first, the prefix may remain.
+    for (const id of abandoned) {
+      try {
+        await this.store.removeEntry(dataName(id));
+      } catch {
+        // See above.
+      }
+    }
+    if (lost.size > 0) {
+      throw (
+        failure ??
+        new Error(`uwasi: ${lost.size} files lost their content at close`)
+      );
     }
   }
 
