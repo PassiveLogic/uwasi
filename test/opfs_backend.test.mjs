@@ -1629,6 +1629,81 @@ describe("namespace change log", () => {
   });
 });
 
+/** create + write + close, without fd_sync: fine past the spare pool. */
+function writeFile(h, name, text) {
+  const { errno, fd } = sysCreate(h, name);
+  assert.strictEqual(errno, ESUCCESS, `creating ${name}`);
+  assert.strictEqual(sysWrite(h, fd, text).errno, ESUCCESS);
+  assert.strictEqual(sysClose(h, fd), ESUCCESS);
+}
+
+function dataFileCount(store) {
+  return store.rootNames().filter((n) => n.startsWith(".uwasi.data.")).length;
+}
+
+describe("handle pool lifecycle", () => {
+  it("close trims spares freed by unlinks back to the pool target", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    for (let i = 0; i < 20; i++) writeFile(w.h, `f${i}`, `content ${i}`);
+    await w.backend.settle();
+    for (let i = 0; i < 20; i++) assert.strictEqual(sysUnlink(w.h, `f${i}`), 0);
+    await w.backend.close();
+    assert.strictEqual(dataFileCount(store), 2, "only the pool target is left");
+
+    const w2 = await makeWorker(store, { spareFiles: 2 });
+    assert.strictEqual(dataFileCount(store), 2);
+    await w2.backend.close();
+  });
+
+  it("re-init after a crash removes leftover data files beyond the pool", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    for (let i = 0; i < 20; i++) writeFile(w.h, `f${i}`, `secret ${i}`);
+    writeFile(w.h, "kept", "kept");
+    await w.backend.settle();
+    for (let i = 0; i < 20; i++) assert.strictEqual(sysUnlink(w.h, `f${i}`), 0);
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store, { spareFiles: 2 });
+    assert.strictEqual(dataFileCount(store), 3, "kept plus two spares");
+    for (let i = 0; i < 20; i++) {
+      assert.strictEqual(findDataFileContaining(store, `secret ${i}`), null);
+    }
+    assert.strictEqual(
+      sysReadText(w2.h, sysOpen(w2.h, "kept").fd).text,
+      "kept",
+    );
+    await w2.backend.close();
+  });
+
+  it("settle materializes a large overdraft with every file's content intact", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    for (let i = 0; i < 200; i++) {
+      const { fd } = sysCreate(w.h, `f${i}`);
+      sysWrite(w.h, fd, `payload ${i}`);
+      sysClose(w.h, fd);
+    }
+    await w.backend.settle();
+    for (let i = 0; i < 200; i += 37) {
+      const { fd } = sysOpen(w.h, `f${i}`);
+      assert.strictEqual(sysSync(w.h, fd), ESUCCESS, "materialized");
+      sysClose(w.h, fd);
+    }
+    store.simulateCrash();
+
+    const w2 = await makeWorker(store);
+    for (let i = 0; i < 200; i++) {
+      assert.strictEqual(
+        sysReadText(w2.h, sysOpen(w2.h, `f${i}`).fd).text,
+        `payload ${i}`,
+      );
+    }
+    await w2.backend.close();
+  });
+});
+
 describe("atomic rename over an existing target", () => {
   it("rename-replace records the new mapping before destroying the replaced content", async () => {
     const store = new MockOPFS();

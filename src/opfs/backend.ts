@@ -137,6 +137,45 @@ function involvesDevice(node: FSNode | undefined): boolean {
 }
 
 /**
+ * OPFS handle operations in flight at once. Each is an async round trip
+ * to the browser's storage backend; issuing them together overlaps that
+ * latency, and the bound keeps a large store from flooding it.
+ */
+const HANDLE_CONCURRENCY = 32;
+
+/**
+ * Run `task` over `items`, at most `HANDLE_CONCURRENCY` at a time. After
+ * the first failure no new task starts; the ones in flight finish (their
+ * side effects, such as recording an acquired handle, still happen), then
+ * the first failure is thrown.
+ */
+async function forEachConcurrently<T>(
+  items: T[],
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  const state = { next: 0, failed: false, error: undefined as unknown };
+  const worker = async (): Promise<void> => {
+    while (!state.failed && state.next < items.length) {
+      const item = items[state.next++];
+      try {
+        await task(item);
+      } catch (error) {
+        if (!state.failed) {
+          state.failed = true;
+          state.error = error;
+        }
+      }
+    }
+  };
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < Math.min(HANDLE_CONCURRENCY, items.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  if (state.failed) throw state.error;
+}
+
+/**
  * Write all of `data` at `at`. OPFS reports partial writes (e.g. under
  * quota pressure) only through the return value; a short write must never
  * pass as success, so it becomes a `RangeError` - which `errnoOf` maps to
@@ -386,49 +425,38 @@ export class OPFSBackend implements FSBackend {
     this.nextDirId = replay.maxDir + 1;
 
     // Claim every referenced data file's handle for life.
-    for (const [, id] of this.physByNode) {
-      let fileHandle = dataFiles.get(id);
-      if (!fileHandle) {
-        // Referenced but physically missing (a foreign actor removed it,
-        // or `close()` did for a file it reported lost): surface it as an
-        // empty file rather than failing the whole store.
-        fileHandle = await this.store.getFileHandle(dataName(id), {
-          create: true,
-        });
-      }
-      dataFiles.delete(id);
-      this.handleById.set(id, await fileHandle.createSyncAccessHandle());
-    }
+    const referenced = [...this.physByNode.values()];
+    for (const id of referenced) dataFiles.delete(id);
+    await forEachConcurrently(referenced, async (id) => {
+      // A referenced file that is physically missing (a foreign actor
+      // removed it, or `close()` did for a file it reported lost) is
+      // recreated: it surfaces as an empty file rather than failing the
+      // whole store. Only a failed open closes the backend, once this has
+      // finished, so a handle always arrives.
+      this.handleById.set(id, (await this.openDataFile(id))!);
+    });
 
     // Reclaim tombstones: destroy any leftover content, reuse as spares.
-    for (const [id, fileHandle] of dataFiles) {
-      const handle = await fileHandle.createSyncAccessHandle();
+    // Only as many as the pool needs are opened; the rest are removed
+    // without ever taking their (lock-holding) handles.
+    const leftovers = [...dataFiles.keys()].sort((a, b) => a - b);
+    const reused = leftovers.slice(0, this.spareTarget);
+    await forEachConcurrently(reused, async (id) => {
+      const handle = await dataFiles.get(id)!.createSyncAccessHandle();
       this.handleById.set(id, handle);
       handle.truncate(0);
       handle.flush();
-      this.spares.push(id);
-    }
+    });
+    this.spares.push(...reused);
+    await forEachConcurrently(leftovers.slice(this.spareTarget), (id) =>
+      this.store.removeEntry(dataName(id)),
+    ).catch(() => {
+      // Best effort: the files are unreferenced, and the next open
+      // reclaims them again.
+    });
 
-    // Size the spare pool: pre-create what is missing, remove any excess.
-    while (this.spares.length < this.spareTarget) {
-      const id = this.nextId++;
-      const fileHandle = await this.store.getFileHandle(dataName(id), {
-        create: true,
-      });
-      this.handleById.set(id, await fileHandle.createSyncAccessHandle());
-      this.spares.push(id);
-    }
-    while (this.spares.length > this.spareTarget) {
-      const id = this.spares.pop()!;
-      this.handleById.get(id)!.close();
-      this.handleById.delete(id);
-      try {
-        await this.store.removeEntry(dataName(id));
-      } catch {
-        // Best effort: the file is unreferenced, and the next open
-        // reclaims it again.
-      }
-    }
+    // Pre-create whatever the pool still lacks.
+    await this.refillSpares();
 
     // Fold the replayed log into a fresh snapshot and start an empty log.
     // A failed log reset leaves the backend correct but snapshotting on
@@ -908,7 +936,8 @@ export class OPFSBackend implements FSBackend {
       .then(async () => {
         this.replenishScheduled = false;
         // Materialize overdrafted files first: each waits on a durability
-        // guarantee (`sync` fails until its physical file exists). One
+        // guarantee (`sync` fails until its physical file exists). Files
+        // overdrafted meanwhile are picked up by the next batch. One
         // failure does not hold the others back.
         const failures: unknown[] = [];
         const tried = new Set<FileNode>();
@@ -917,24 +946,18 @@ export class OPFSBackend implements FSBackend {
             ([node]) => !tried.has(node),
           );
           if (batch.length === 0) break;
-          for (const [node, id] of batch) {
-            tried.add(node);
+          for (const [node] of batch) tried.add(node);
+          await forEachConcurrently(batch, async ([node, id]) => {
             try {
               await this.materialize(node, id);
             } catch (error) {
               failures.push(error);
             }
-          }
+          });
         }
         if (failures.length > 0) throw failures[0];
         // Then refill the spare pool.
-        while (this.spares.length < this.spareTarget && !this.closed) {
-          const id = this.nextId++;
-          const handle = await this.openDataFile(id);
-          if (handle === undefined) return;
-          this.handleById.set(id, handle);
-          this.spares.push(id);
-        }
+        if (!this.closed) await this.refillSpares();
       });
     // `settle()` and `close()` report a failure; nothing else awaits it.
     this.background.catch(() => {});
@@ -1017,6 +1040,20 @@ export class OPFSBackend implements FSBackend {
     node.content = new Uint8Array(0);
   }
 
+  /** Create spare data files until the pool reaches its target. */
+  private async refillSpares(): Promise<void> {
+    const ids: number[] = [];
+    while (this.spares.length + ids.length < this.spareTarget) {
+      ids.push(this.nextId++);
+    }
+    await forEachConcurrently(ids, async (id) => {
+      const handle = await this.openDataFile(id);
+      if (handle === undefined) return;
+      this.handleById.set(id, handle);
+      this.spares.push(id);
+    });
+  }
+
   private errnoOf(error: unknown): number {
     if (error instanceof RangeError) return FSErrno.NOSPC;
     if ((error as { name?: string } | null)?.name === "QuotaExceededError") {
@@ -1084,49 +1121,54 @@ export class OPFSBackend implements FSBackend {
     if (failure !== undefined) throw failure;
   }
 
-  private async adoptSubtree(dir: DirectoryNode): Promise<void> {
-    for (const name of Object.keys(dir.entries)) {
-      // The guest runs while this awaits, so an entry may be gone.
-      const child = dir.entries[name] as FSNode | undefined;
-      if (child === undefined) continue;
-      if (child.type === "dir") {
-        await this.adoptSubtree(child);
-      } else if (
-        child.type === "file" &&
-        !this.physByNode.has(child) &&
-        // Overdrafted files already have an id; settle() materializes them.
-        !this.pendingIds.has(child)
-      ) {
-        const id = this.nextId++;
-        const handle = await this.openDataFile(id);
-        if (handle === undefined) return;
-        this.handleById.set(id, handle);
-        if (
-          this.physByNode.has(child) ||
-          this.pendingIds.has(child) ||
-          child.nlink === 0
+  private async adoptSubtree(root: DirectoryNode): Promise<void> {
+    const unadopted: FileNode[] = [];
+    const walk = (dir: DirectoryNode): void => {
+      for (const name of Object.keys(dir.entries)) {
+        const child = dir.entries[name];
+        if (child.type === "dir") {
+          walk(child);
+        } else if (
+          child.type === "file" &&
+          !this.physByNode.has(child) &&
+          // Overdrafted files already have an id; settle() materializes them.
+          !this.pendingIds.has(child)
         ) {
-          // Adopted while the handle was on its way, by a guest open or a
-          // snapshot, and maybe written and synced since; or unlinked (or
-          // replaced by a rename), so no name needs its bytes. The new
-          // data file is empty and no record names it: keep it as a spare.
-          this.spares.push(id);
-          continue;
+          unadopted.push(child);
         }
-        try {
-          if (child.content.byteLength > 0) {
-            writeFully(handle, child.content, 0);
-          }
-          handle.flush();
-        } catch (error) {
-          // No record names the new data file: empty it for the pool.
-          this.recycleAbandoned(id, false);
-          throw error;
-        }
-        this.physByNode.set(child, id);
-        child.content = new Uint8Array(0);
       }
-    }
+    };
+    walk(root);
+    await forEachConcurrently(unadopted, async (child) => {
+      const id = this.nextId++;
+      const handle = await this.openDataFile(id);
+      if (handle === undefined) return;
+      this.handleById.set(id, handle);
+      if (
+        this.physByNode.has(child) ||
+        this.pendingIds.has(child) ||
+        child.nlink === 0
+      ) {
+        // Adopted while the handle was on its way, by a guest open or a
+        // snapshot, and maybe written and synced since; or unlinked (or
+        // replaced by a rename), so no name needs its bytes. The new data
+        // file is empty and no record names it: keep it as a spare.
+        this.spares.push(id);
+        return;
+      }
+      try {
+        if (child.content.byteLength > 0) {
+          writeFully(handle, child.content, 0);
+        }
+        handle.flush();
+      } catch (error) {
+        // No record names the new data file: empty it for the pool.
+        this.recycleAbandoned(id, false);
+        throw error;
+      }
+      this.physByNode.set(child, id);
+      child.content = new Uint8Array(0);
+    });
   }
 
   /**
@@ -1157,7 +1199,23 @@ export class OPFSBackend implements FSBackend {
     );
     this.closed = true;
     await this.background.catch(() => {});
-    // A guest call during that wait may have overdrafted a file that no
+    // Leave the pool at its target, so the next `create()` does not have
+    // to open and remove data files freed by this session's unlinks.
+    const excess = this.spares.splice(this.spareTarget);
+    for (const id of excess) {
+      try {
+        this.handleById.get(id)!.close();
+      } catch {
+        // Already closed or revoked; the removal below may still work.
+      }
+      this.handleById.delete(id);
+    }
+    await forEachConcurrently(excess, (id) =>
+      this.store.removeEntry(dataName(id)),
+    ).catch(() => {
+      // Best effort: re-init reclaims whatever is left.
+    });
+    // A guest call during those waits may have overdrafted a file that no
     // round can give a data file any more.
     for (const node of this.pendingIds.keys()) lost.add(node);
     // Closing a sync access handle only releases it: the File System
