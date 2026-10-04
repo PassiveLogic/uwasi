@@ -713,9 +713,9 @@ export class OPFSBackend implements FSBackend {
     } catch (error) {
       try {
         // A failed write may leave part of the content in the file, and
-        // `close()` flushes every handle it releases. Empty the file, so no
-        // later flush publishes a prefix the file never held as a whole;
-        // the content stays in memory for the retry.
+        // releasing the handle at `close()` may persist it. Empty the
+        // file, so nothing publishes a prefix the file never held as a
+        // whole; the content stays in memory for the retry.
         handle.truncate(0);
       } catch {
         // Then a later flush, or the storage itself before a crash, may
@@ -826,10 +826,12 @@ export class OPFSBackend implements FSBackend {
   }
 
   /**
-   * Flush and release every handle; the backend is unusable afterwards.
-   * Rejects, once everything is released, if a file created past the
-   * spare pool still could not get its data file: its name is recorded,
-   * but the content it held only in memory is lost.
+   * Make every file's content durable and release every handle; the
+   * backend is unusable afterwards. Rejects, once everything is released,
+   * if a file created past the spare pool still could not get its data
+   * file (its name is recorded, but the content it held only in memory is
+   * lost), or if flushing a file's content failed (what was written to it
+   * since its last successful `fd_sync` may be lost).
    */
   async close(): Promise<void> {
     if (this.closed) return;
@@ -854,12 +856,16 @@ export class OPFSBackend implements FSBackend {
     // A guest call during that wait may have overdrafted a file that no
     // round can give a data file any more.
     for (const node of this.pendingIds.keys()) lost.add(node);
+    // Closing a sync access handle only releases it: the File System
+    // Standard leaves persisting its writes to `flush()`.
+    const flushFailure = this.flushDataFiles();
     this.releaseHandles();
     // A failed attempt that could not empty its data file left part of a
-    // lost file's content there, and closing the handle flushed it.
-    // Remove those data files, so the next open recreates them empty
-    // rather than showing a prefix the file never held. Best effort: if
-    // the removal fails, or a crash comes first, the prefix may remain.
+    // lost file's content there, and closing the handle may have
+    // persisted it. Remove those data files, so the next open recreates
+    // them empty rather than showing a prefix the file never held. Best
+    // effort: if the removal fails, or a crash comes first, the prefix may
+    // remain.
     for (const id of abandoned) {
       try {
         await this.store.removeEntry(dataName(id));
@@ -873,6 +879,27 @@ export class OPFSBackend implements FSBackend {
         new Error(`uwasi: ${lost.size} files lost their content at close`)
       );
     }
+    if (flushFailure !== undefined) throw flushFailure;
+  }
+
+  /**
+   * Flush the data file of every file the guest may still reach; unlinked
+   * files awaiting their last close are skipped. The namespace slots are
+   * not flushed: every successful change flushed its record already, and
+   * a failed one may have left bytes there that a flush would publish.
+   * Every file is tried; returns the first failure.
+   */
+  private flushDataFiles(): unknown {
+    let failure: unknown = undefined;
+    for (const [node, id] of this.physByNode) {
+      if (this.pendingTombstones.has(node)) continue;
+      try {
+        this.handleById.get(id)!.flush();
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    return failure;
   }
 
   private releaseHandles(): void {

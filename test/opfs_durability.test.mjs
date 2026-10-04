@@ -694,3 +694,66 @@ describe("device nodes", () => {
     assert.deepStrictEqual(listNames(fresh.backend, "/dev"), ["null", "g"]);
   });
 });
+
+describe("a clean close", () => {
+  // close() on a sync access handle need not persist anything; only
+  // flush() does. This store's close() only releases, and drops whatever
+  // was left unflushed.
+  const releasing = () => new MockOPFS({ closeFlushes: false });
+
+  async function reopenedText(store, name) {
+    const fresh = await makeWorker(store);
+    const opened = sysOpen(fresh.h, name);
+    assert.strictEqual(opened.errno, ESUCCESS, `open ${name}`);
+    const { text } = sysReadText(fresh.h, opened.fd);
+    await fresh.backend.close();
+    return text;
+  }
+
+  it("persists what was written to a spare-backed file", async () => {
+    const store = releasing();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const f = sysCreate(w.h, "saved");
+    assert.strictEqual(sysWrite(w.h, f.fd, "SAVED").errno, ESUCCESS);
+    assert.strictEqual(sysClose(w.h, f.fd), ESUCCESS);
+    await w.backend.close();
+    assert.strictEqual(await reopenedText(store, "saved"), "SAVED");
+  });
+
+  it("persists later writes to a file that got its data file in the background", async () => {
+    const store = releasing();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const f = sysCreate(w.h, "late");
+    assert.strictEqual(sysWrite(w.h, f.fd, "first").errno, ESUCCESS);
+    await w.backend.settle();
+    assert.strictEqual(sysWrite(w.h, f.fd, " second").errno, ESUCCESS);
+    // The fd stays open across the close.
+    await w.backend.close();
+    assert.strictEqual(await reopenedText(store, "late"), "first second");
+  });
+
+  it("rejects when a file's content cannot be flushed, releasing every handle", async () => {
+    const store = releasing();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const f = sysCreate(w.h, "doomed");
+    assert.strictEqual(sysWrite(w.h, f.fd, "DOOMED").errno, ESUCCESS);
+    const fault = store.injectFault({ op: "flush", match: ".uwasi.data." });
+    await assert.rejects(w.backend.close(), { name: "QuotaExceededError" });
+    assert.strictEqual(fault.fired, 1);
+    // Every lock was released: the store opens again in this worker.
+    const fresh = await makeWorker(store);
+    assert.strictEqual(sysStat(fresh.h, "doomed").errno, ESUCCESS);
+    await fresh.backend.close();
+  });
+
+  it("does not flush the namespace record, which may hold a failed change", async () => {
+    const store = releasing();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const start = store.opLog.length;
+    await w.backend.close();
+    const flushed = store.opLog
+      .slice(start)
+      .filter((entry) => entry.op === "flush" && entry.path.includes("meta"));
+    assert.deepStrictEqual(flushed, []);
+  });
+});
