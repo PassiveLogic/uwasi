@@ -563,3 +563,55 @@ describe("a failed unlink of a file past the spare pool", () => {
     );
   });
 });
+
+describe("persistAll() racing the guest", () => {
+  it("keeps the data a guest open wrote and synced while it waited", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    w.backend.fileSystem.addFile("/s", "SEED");
+    const gate = store.holdAsync({
+      op: "getFileHandle",
+      match: ".uwasi.data.",
+    });
+    const persisting = w.backend.persistAll();
+    await gate.parked(1);
+    // The guest's open adopts the file into a spare meanwhile.
+    const opened = sysOpen(w.h, "s");
+    assert.strictEqual(opened.errno, ESUCCESS);
+    assert.strictEqual(sysWrite(w.h, opened.fd, "GUEST").errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, opened.fd), ESUCCESS);
+    gate.release();
+    await persisting;
+    assert.strictEqual(sysWrite(w.h, opened.fd, "!").errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, opened.fd), ESUCCESS);
+    store.simulateCrash();
+    assert.strictEqual(
+      await readAfterReopen(store, "s", { spareFiles: 2 }),
+      "GUEST!",
+    );
+  });
+
+  it("does not adopt a seeded file the guest unlinked while it waited", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    w.backend.fileSystem.addFile("/s", "SEED");
+    const gate = store.holdAsync({
+      op: "getFileHandle",
+      match: ".uwasi.data.",
+    });
+    const persisting = w.backend.persistAll();
+    await gate.parked(1);
+    assert.strictEqual(sysUnlink(w.h, "s"), ESUCCESS);
+    gate.release();
+    await persisting;
+    // The data file persistAll() acquired names nothing: it is a spare,
+    // empty, rather than a locked copy of the unlinked file.
+    await w.backend.close();
+    for (const name of store.rootNames()) {
+      if (!name.startsWith(".uwasi.data.")) continue;
+      const text = new TextDecoder().decode(store.durableContent(name));
+      assert.strictEqual(text, "", `${name} holds the unlinked file's bytes`);
+    }
+    assert.strictEqual(await readAfterReopen(store, "s"), null);
+  });
+});

@@ -745,7 +745,9 @@ export class OPFSBackend implements FSBackend {
 
   private async adoptSubtree(dir: DirectoryNode): Promise<void> {
     for (const name of Object.keys(dir.entries)) {
-      const child = dir.entries[name];
+      // The guest runs while this awaits, so an entry may be gone.
+      const child = dir.entries[name] as FSNode | undefined;
+      if (child === undefined) continue;
       if (child.type === "dir") {
         await this.adoptSubtree(child);
       } else if (
@@ -755,15 +757,31 @@ export class OPFSBackend implements FSBackend {
         !this.pendingIds.has(child)
       ) {
         const id = this.nextId++;
-        const fileHandle = await this.store.getFileHandle(dataName(id), {
-          create: true,
-        });
-        const handle = await fileHandle.createSyncAccessHandle();
-        if (child.content.byteLength > 0) {
-          writeFully(handle, child.content, 0);
-        }
-        handle.flush();
+        const handle = await this.openDataFile(id);
+        if (handle === undefined) return;
         this.handleById.set(id, handle);
+        if (
+          this.physByNode.has(child) ||
+          this.pendingIds.has(child) ||
+          child.nlink === 0
+        ) {
+          // Adopted while the handle was on its way, by a guest open or a
+          // snapshot, and maybe written and synced since; or unlinked (or
+          // replaced by a rename), so no name needs its bytes. The new
+          // data file is empty and no record names it: keep it as a spare.
+          this.spares.push(id);
+          continue;
+        }
+        try {
+          if (child.content.byteLength > 0) {
+            writeFully(handle, child.content, 0);
+          }
+          handle.flush();
+        } catch (error) {
+          // No record names the new data file: empty it for the pool.
+          this.recycleAbandoned(id, false);
+          throw error;
+        }
         this.physByNode.set(child, id);
         child.content = new Uint8Array(0);
       }
