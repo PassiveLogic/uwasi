@@ -31,7 +31,12 @@ export interface FSBackend {
   writeAt(node: FileNode, data: Uint8Array, offset: number): number;
   /** Truncate or zero-fill-extend the file to `size`. Returns an errno. */
   resize(node: FileNode, size: number): number;
-  /** Flush data and metadata for `fd_sync`. Returns an errno. */
+  /**
+   * Flush data and metadata for `fd_sync`. Returns an errno. On a
+   * directory, every namespace change that has succeeded must be durable
+   * when this returns. A backend whose namespace methods make each change
+   * durable before they return has nothing left to do here.
+   */
   sync(node: FileNode | DirectoryNode): number;
   /** Flush data for `fd_datasync`. Returns an errno. */
   datasync(node: FileNode | DirectoryNode): number;

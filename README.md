@@ -255,7 +255,7 @@ skipped cases using the in-memory backend and an OPFS mock, not a real browser
 | `fd_advise` | ✅ | Validates the advice; otherwise a no-op |
 | `fd_allocate` | ✅ | Grows the file to `offset + len`, never shrinks |
 | `fd_close` | ✅ | Preopens are closable |
-| `fd_datasync` / `fd_sync` | ✅ | Memory FS: no-op success (memory is always "synced"); OPFS: a real `flush()` of the sync access handle |
+| `fd_datasync` / `fd_sync` | ✅ | Memory FS: no-op success (memory is always "synced"); OPFS: a real `flush()` of the file's sync access handle; on a directory, success at once, since every guest namespace change is durable when its syscall returns; it does not record host-seeded files (see `persistAll()`) |
 | `fd_fdstat_get` | ✅ | Reports real per-fd flags and rights |
 | `fd_fdstat_set_flags` | ✅ | `APPEND` honored by `fd_write` |
 | `fd_fdstat_set_rights` | ✅ | Rights may only shrink (`NOTCAPABLE` otherwise) |

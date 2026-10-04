@@ -193,6 +193,16 @@ export class OPFSBackend implements FSBackend {
   /** Ids of pre-created, empty, claimable data files. */
   private spares: number[] = [];
   /**
+   * Ids of emptied data files that a namespace record may still name: the
+   * durable record a failed unlink did not replace, or the snapshot a
+   * failed change left in a slot, which a later flush (or the storage
+   * itself) can still make durable. A spare gets new content, so handing
+   * one of these out would let that name show another file's bytes. They
+   * rejoin the pool once a snapshot is durable: it names none of them,
+   * and it overwrites the slot any failed snapshot was left in.
+   */
+  private quarantine: number[] = [];
+  /**
    * Files created past the spare pool: their id is already durable in the
    * namespace record, their content still lives in `node.content` until
    * the background materializer creates the physical file.
@@ -421,6 +431,7 @@ export class OPFSBackend implements FSBackend {
     handle.flush();
     this.generation = generation;
     for (const file of files) this.known.add(file);
+    this.spares.push(...this.quarantine.splice(0));
   }
 
   /** Serialize `dir`'s subtree, collecting the file nodes it names. */
@@ -485,9 +496,10 @@ export class OPFSBackend implements FSBackend {
   /**
    * Destroy a file's durable content and recycle its data file. Deferred
    * to the last `closeFile` while fds are open (dangling-fd semantics).
-   * Returns an errno; on failure nothing is recycled.
+   * `mayBeNamed` says a record that may yet become durable still names the
+   * file (see `recycle`). Returns an errno; on failure nothing is recycled.
    */
-  private tombstone(node: FileNode): number {
+  private tombstone(node: FileNode, mayBeNamed: boolean): number {
     const pendingId = this.pendingIds.get(node);
     if (pendingId !== undefined) {
       // Never materialized: nothing durable exists to destroy, and the
@@ -495,7 +507,7 @@ export class OPFSBackend implements FSBackend {
       // may already have created. Open fds keep working on the in-memory
       // content.
       this.pendingIds.delete(node);
-      this.recycleAbandoned(pendingId);
+      this.recycleAbandoned(pendingId, mayBeNamed);
       return FSErrno.SUCCESS;
     }
     if (!this.physByNode.has(node)) return FSErrno.SUCCESS;
@@ -503,7 +515,16 @@ export class OPFSBackend implements FSBackend {
       this.pendingTombstones.add(node);
       return FSErrno.SUCCESS;
     }
-    return this.destroyContent(node);
+    return this.destroyContent(node, mayBeNamed);
+  }
+
+  /**
+   * Return an emptied data file to the spare pool, or, while a record that
+   * may yet become durable still names it, to `quarantine`.
+   */
+  private recycle(id: number, mayBeNamed: boolean): void {
+    if (mayBeNamed) this.quarantine.push(id);
+    else this.spares.push(id);
   }
 
   /**
@@ -512,13 +533,13 @@ export class OPFSBackend implements FSBackend {
    * attempt still acquiring one has not tracked it yet, and recycles it
    * itself.)
    */
-  private recycleAbandoned(id: number): void {
+  private recycleAbandoned(id: number, mayBeNamed: boolean): void {
     const handle = this.handleById.get(id);
     if (handle === undefined) return;
     try {
       handle.truncate(0);
       handle.flush();
-      this.spares.push(id);
+      this.recycle(id, mayBeNamed);
     } catch {
       // It may still hold content, so it cannot be a spare. Release its
       // lock instead; re-init reclaims the unreferenced data file.
@@ -531,7 +552,7 @@ export class OPFSBackend implements FSBackend {
     }
   }
 
-  private destroyContent(node: FileNode): number {
+  private destroyContent(node: FileNode, mayBeNamed: boolean): number {
     const id = this.physByNode.get(node)!;
     const handle = this.handleById.get(id)!;
     // Content destruction must be durable before the namespace change
@@ -547,7 +568,7 @@ export class OPFSBackend implements FSBackend {
     }
     this.physByNode.delete(node);
     this.known.delete(node);
-    this.spares.push(id);
+    this.recycle(id, mayBeNamed);
     return FSErrno.SUCCESS;
   }
 
@@ -638,9 +659,10 @@ export class OPFSBackend implements FSBackend {
     }
     if (this.pendingIds.get(node) !== id || this.closed) {
       // Unlinked (or shut down) while we were acquiring the handle:
-      // recycle the physical file as a spare.
+      // recycle the physical file. Whether the record that dropped the id
+      // became durable is no longer known here, so assume it did not.
       if (this.pendingIds.get(node) === id) this.pendingIds.delete(node);
-      this.recycleAbandoned(id);
+      this.recycleAbandoned(id, true);
       return;
     }
     try {
@@ -905,11 +927,10 @@ export class OPFSBackend implements FSBackend {
         // never adopted - nothing durable was promised yet, so there is
         // nothing to flush.
         if (id !== undefined) this.handleById.get(id)!.flush();
-      } else {
-        // Directory sync: the namespace record is flushed on every change
-        // already; flush it again as a harmless hardening point.
-        for (const handle of this.metaHandles) handle.flush();
       }
+      // A directory needs nothing: every namespace change flushed its
+      // record before its syscall returned. Flushing the slots again could
+      // only make durable a snapshot that a failed change left behind.
     } catch (error) {
       return this.errnoOf(error);
     }
@@ -955,8 +976,9 @@ export class OPFSBackend implements FSBackend {
     this.openCounts.delete(node);
     if (this.pendingTombstones.delete(node)) {
       // A failure here has nowhere to be reported; the data file stays
-      // mapped and unreferenced, and re-init reclaims it.
-      this.destroyContent(node);
+      // mapped and unreferenced, and re-init reclaims it. The unlink is
+      // durable, so no record names the data file any more.
+      this.destroyContent(node, false);
     }
   }
 
@@ -985,6 +1007,12 @@ export class OPFSBackend implements FSBackend {
         parent.entries[name] = node;
       });
     } catch (error) {
+      if (node.type === "file") {
+        // Hand back the data file (or overdraft id) the record would have
+        // named. The failed snapshot may still name it, so it waits in
+        // quarantine rather than backing the next file at once.
+        this.tombstone(node, true);
+      }
       return this.errnoOf(error);
     }
     return FSErrno.SUCCESS;
@@ -995,8 +1023,9 @@ export class OPFSBackend implements FSBackend {
     if (node !== undefined && node.type === "file") {
       // Step 1: destroy the content durably, or defer that to the last
       // close while fds are open, before the unlink itself becomes
-      // durable in step 2. If this fails, the name keeps resolving.
-      const errno = this.tombstone(node);
+      // durable in step 2. If this fails, the name keeps resolving. Until
+      // step 2 is durable the record still names the data file.
+      const errno = this.tombstone(node, true);
       if (errno !== FSErrno.SUCCESS) return errno;
     }
     try {
@@ -1007,7 +1036,8 @@ export class OPFSBackend implements FSBackend {
     } catch (error) {
       // The name keeps resolving. The content may already be gone,
       // leaving the name mapped to an empty file - the documented crash
-      // window of step 1.
+      // window of step 1. Its data file stays in quarantine, since the
+      // durable record still maps the name to it.
       if (node !== undefined && node.type === "file") {
         this.pendingTombstones.delete(node);
       }
@@ -1046,7 +1076,7 @@ export class OPFSBackend implements FSBackend {
       // The record no longer references the replaced target, so this is
       // cleanup rather than a durability point: a failure here leaves an
       // unreferenced data file that re-init reclaims.
-      this.tombstone(replaced);
+      this.tombstone(replaced, false);
     }
     return FSErrno.SUCCESS;
   }

@@ -442,3 +442,80 @@ describe("path_rename of a directory", () => {
     await fresh.backend.close();
   });
 });
+
+/** Open the store in a fresh worker and read `name`, or null if missing. */
+async function readAfterReopen(store, name, options = {}) {
+  const w = await makeWorker(store, options);
+  const opened = sysOpen(w.h, name);
+  const text =
+    opened.errno === ESUCCESS ? sysReadText(w.h, opened.fd).text : null;
+  await w.backend.close();
+  return text;
+}
+
+describe("a data file a record may still name is not reused", () => {
+  // A synced file whose unlink destroys its content, then fails to record
+  // the removal: the durable record still maps the name to the data file.
+  // A host-seeded file's first open then claims a spare and writes its
+  // content into it, and fails to record that.
+  async function failedUnlinkThenSeededOpen(store) {
+    const w = await makeWorker(store, { spareFiles: 1 });
+    const a = sysCreate(w.h, "a");
+    assert.strictEqual(sysWrite(w.h, a.fd, "AAAA").errno, ESUCCESS);
+    assert.strictEqual(sysSync(w.h, a.fd), ESUCCESS);
+    assert.strictEqual(sysClose(w.h, a.fd), ESUCCESS);
+    const unlinkFault = store.injectFault({
+      op: "write",
+      match: ".uwasi.meta.",
+    });
+    assert.notStrictEqual(sysUnlink(w.h, "a"), ESUCCESS);
+    assert.strictEqual(unlinkFault.fired, 1);
+    w.backend.fileSystem.addFile("/s", "SEED");
+    const openFault = store.injectFault({ op: "write", match: ".uwasi.meta." });
+    assert.notStrictEqual(sysOpen(w.h, "s").errno, ESUCCESS);
+    assert.strictEqual(openFault.fired, 1);
+    return w;
+  }
+
+  it("a failed unlink's name never shows another file's bytes after a crash", async () => {
+    const store = new MockOPFS();
+    await failedUnlinkThenSeededOpen(store);
+    store.simulateCrash();
+    store.clearFaults();
+    const text = await readAfterReopen(store, "a", { spareFiles: 1 });
+    assert.ok(text === "" || text === "AAAA", `a shows ${text}`);
+  });
+
+  it("a failed unlink's name never shows another file's bytes after a clean close", async () => {
+    const store = new MockOPFS();
+    const w = await failedUnlinkThenSeededOpen(store);
+    store.clearFaults();
+    await w.backend.close();
+    const text = await readAfterReopen(store, "a", { spareFiles: 1 });
+    assert.ok(text === "" || text === "AAAA", `a shows ${text}`);
+  });
+
+  it("a failed create's name never shows another file's bytes", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 1 });
+    // The create's record is written but neither flushed nor removed, so
+    // anything that persists it later can make it durable - here the
+    // mock's close(), which persists what a handle holds.
+    const flush = store.injectFault({ op: "flush", match: ".uwasi.meta." });
+    const truncate = store.injectFault({
+      op: "truncate",
+      match: ".uwasi.meta.",
+    });
+    assert.notStrictEqual(sysCreate(w.h, "b").errno, ESUCCESS);
+    assert.ok(flush.fired + truncate.fired > 0, "recording b must fail");
+    w.backend.fileSystem.addFile("/s", "SEED");
+    store.clearFaults();
+    const write = store.injectFault({ op: "write", match: ".uwasi.meta." });
+    assert.notStrictEqual(sysOpen(w.h, "s").errno, ESUCCESS);
+    assert.strictEqual(write.fired, 1);
+    store.clearFaults();
+    await w.backend.close();
+    const text = await readAfterReopen(store, "b", { spareFiles: 1 });
+    assert.ok(text === null || text === "", `b shows ${text}`);
+  });
+});
