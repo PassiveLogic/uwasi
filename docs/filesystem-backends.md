@@ -159,6 +159,61 @@ pointer followed by a 32-bit length. The preopen descriptor, create flag, seek
 origin and rights mask follow the WASI Preview 1 ABI. Payload values are test
 data; `UNCHANGED_OUTPUT` detects accidental result writes on a failed operation.
 
+## Sizing the OPFS Spare Pool
+
+Guest syscalls are synchronous, but creating an OPFS file is not. The backend
+bridges the two with a pool of pre-created, empty data files, each held open: a
+guest file create claims one synchronously. When a guest call creates more files
+than the pool holds, the excess files _overdraft_:
+
+- Their names are recorded durably as usual, but their bytes stay in memory until
+  the backend creates their data files in the background.
+- `fd_sync` and `fd_datasync` on them return `NOSPC` until then.
+- A crash before that happens leaves those names mapped to empty files.
+
+Background work (creating overdrafted files and refilling the pool) runs only when
+the event loop gets a turn, which means between guest calls, never during one. A
+host that starts the next guest call as soon as the last returns, for example
+from a message handler, may never let it finish.
+
+A host controls this with two things:
+
+- **`spareFiles`** (default 16) sets the pool size. Set it to at least the number
+  of spares one guest call claims; files beyond it overdraft. A call claims one
+  spare per file it creates and per host-seeded file it opens for the first time.
+  A snapshot of the namespace (every compaction, and any change no log record can
+  express, such as renaming a seeded file) also claims one for every reachable
+  seeded file not yet persisted; `persistAll()` after seeding avoids that. A
+  failed create's spare waits in quarantine until the next snapshot succeeds,
+  since the failed record may still name it. Each spare is an open sync access
+  handle on an empty data file, created at `create()`, so a large pool costs open
+  time and handles. In one Chromium measurement, 1,024 spares
+  added about 130 ms to `create()`.
+- **`await backend.settle()`** waits for the background work: overdrafted files
+  get their data files and the pool is refilled to `spareFiles`. Await it between
+  guest calls whenever files created so far should survive a crash, and before a
+  call that will create many files. It costs time proportional to the files
+  created since the last settle. Guest calls may still run while it waits, and it
+  waits for the work they queue too: it resolves once no work is queued or running
+  and no file is waiting for its data file, so no file reachable at that point
+  still waits for one. A guest that keeps creating files past the pool during every wait
+  can delay it indefinitely. It rejects as soon as storage refuses any of that
+  work; the files it left keep their bytes in memory, and the next `settle()`
+  retries. `persistAll()` waits the same way, then flushes every reachable file.
+
+With `spareFiles` at least the largest burst and `settle()` between calls, no file
+overdrafts. Without `settle()`, a large pool helps only the first call, since the
+refill may not finish before the next. A single call that creates more files than
+the pool always overdrafts the excess; await `settle()` after it to make them
+durable. `close()` also finishes the background work and flushes every file, so a
+clean shutdown keeps every file's bytes, overdrafted ones included; if storage
+refuses any of it, `close()` still releases every handle, then rejects, since
+those bytes may be lost. (Seeded files that nothing has recorded yet are not saved
+by `close()`; see `persistAll()`.)
+
+Fewer, larger files avoid the problem altogether: each file costs a spare, while
+bytes written to an existing file do not.
+
 ## Namespace Record
 
 The OPFS backend persists guest names separately from file content. Each

@@ -343,8 +343,16 @@ export class OPFSBackend implements FSBackend {
       /** Guest preopen directories, as for `MemoryFileSystem`. */
       preopens?: { [guestPath: string]: string };
       /**
-       * Spare data files to keep pre-created: the maximum number of
-       * net-new guest files creatable within one synchronous burst.
+       * Spare data files to keep pre-created (default 16): the number of
+       * files one guest call can back with a data file right away, so
+       * `fd_sync` works. Files past it keep their content in memory until
+       * background work creates their data files, which runs only between
+       * guest calls; see `settle()`. Each spare holds an open sync access
+       * handle, so a larger pool costs open time. Size it to the most
+       * spares one guest call claims: one per file it creates or seeded
+       * file it first opens, one per unpersisted seeded file a snapshot
+       * takes along, and one per failed create, whose data file waits in
+       * quarantine until the next snapshot.
        */
       spareFiles?: number;
     } = {},
@@ -1075,15 +1083,20 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   /**
-   * Wait until background work is quiescent - no round scheduled or
-   * running, no file waiting for its data file - so files created past
-   * the spare pool have their data files, and the pool is refilled.
-   * Guest calls may run while it waits, and it waits for the work they
-   * queue too: no file reachable when it resolves still waits for its
-   * data file. A guest that keeps creating files past the pool during
-   * every wait can delay that indefinitely. Rejects as soon as a round
-   * fails; the files it left overdrafted keep their content in memory,
-   * and the next `settle()` (or file creation) retries.
+   * Wait until background work is quiescent - no round queued or
+   * running, no file waiting for its data file: files created past the
+   * spare pool get their data files (until then their content lives only
+   * in memory and `fd_sync` on them fails), and the pool is refilled to
+   * `spareFiles`. Background work runs only between guest calls, so a
+   * host that starts calls back to back should await this between them
+   * whenever created files should survive a crash, or before a call that
+   * creates many files. Guest calls may still run while it waits, and it
+   * waits for the work they queue too, so no file reachable when it
+   * resolves still waits for its data file; a guest that keeps creating
+   * files past the pool during every wait can delay that indefinitely.
+   * Rejects as soon as a round fails; the files it left keep their
+   * content in memory, and the next `settle()` (or file creation)
+   * retries.
    */
   async settle(): Promise<void> {
     // A fresh round retries what an earlier failed one left, rather than

@@ -210,12 +210,19 @@ next worker, and one that was not unlinked survives byte-for-byte.
 Files can be seeded through `backend.fileSystem` (a `MemoryFileSystem`)
 before the guest starts; call `await backend.persistAll()` afterwards to
 push them to storage. Creating files is synchronous thanks to a pool of
-pre-created spares (`spareFiles` option, default 16); a burst that creates
-more files than that stays correct but defers content durability until the
-event loop turns (`fd_sync` fails honestly with `NOSPC` until then, and
-`await backend.settle()` catches the pool up). Hard links return `NOTSUP`,
-as do linking, renaming, replacing and unlinking device nodes such as
-`/dev/null`, which the runtime recreates at every open.
+pre-created spares (`spareFiles` option, default 16); a guest call that
+claims more spares than that stays correct but defers content durability
+until the event loop turns (`fd_sync` fails honestly with `NOSPC` until
+then). Size `spareFiles` to the most spares one guest call claims: one per
+file it creates and per host-seeded file it opens first, plus seeded files
+a snapshot of the namespace takes along and spares that failed creates
+leave waiting for the next snapshot. `await backend.settle()` between
+guest calls to give every file its data file (so `fd_sync` works) and refill
+the pool; see
+[Sizing the OPFS Spare Pool](docs/filesystem-backends.md#sizing-the-opfs-spare-pool).
+Hard links return `NOTSUP`, as do linking, renaming, replacing and
+unlinking device nodes such as `/dev/null`, which the runtime recreates at
+every open.
 
 The store format is not compatible with stores written by earlier builds
 of this OPFS backend, in its JSON format or an earlier binary one.
