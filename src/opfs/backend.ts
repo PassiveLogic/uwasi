@@ -119,6 +119,25 @@ function decodeMeta(handle: OPFSSyncAccessHandle): MetaPayload | null {
 const MAX_FILE_SIZE = Number.MAX_SAFE_INTEGER;
 
 /**
+ * `data` resized to `size` bytes, zero-filled, or `null` if the engine
+ * refuses to allocate that much. The guest picks the size (a write offset
+ * or a truncate length), and an exception thrown inside a WASI import
+ * traps the guest, so callers report a refusal as a full device, as the
+ * memory backend does.
+ */
+function resizedContent(data: Uint8Array, size: number): Uint8Array | null {
+  let next: Uint8Array;
+  try {
+    next = new Uint8Array(size);
+  } catch (error) {
+    if (error instanceof RangeError) return null;
+    throw error;
+  }
+  next.set(data.subarray(0, Math.min(size, data.byteLength)));
+  return next;
+}
+
+/**
  * Write all of `data` at `at`. OPFS reports partial writes (e.g. under
  * quota pressure) only through the return value; a short write must never
  * pass as success, so it becomes a `RangeError` - which `errnoOf` maps to
@@ -888,8 +907,8 @@ export class OPFSBackend implements FSBackend {
       // the content moves to OPFS wholesale when the node is adopted.
       const end = offset + data.byteLength;
       if (end > node.content.byteLength) {
-        const grown = new Uint8Array(end);
-        grown.set(node.content);
+        const grown = resizedContent(node.content, end);
+        if (grown === null) return FSErrno.NOSPC;
         node.content = grown;
       }
       node.content.set(data, offset);
@@ -916,10 +935,8 @@ export class OPFSBackend implements FSBackend {
     const id = this.physByNode.get(node);
     if (id === undefined) {
       if (size !== node.content.byteLength) {
-        const next = new Uint8Array(size);
-        next.set(
-          node.content.subarray(0, Math.min(size, node.content.byteLength)),
-        );
+        const next = resizedContent(node.content, size);
+        if (next === null) return FSErrno.NOSPC;
         node.content = next;
       }
       return FSErrno.SUCCESS;

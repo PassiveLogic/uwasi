@@ -14,6 +14,7 @@ import {
   sysSync,
   sysReadText,
   sysRename,
+  sysSeekStart,
   sysUnlink,
   sysWrite,
 } from "./syscall_harness.mjs";
@@ -613,5 +614,40 @@ describe("persistAll() racing the guest", () => {
       assert.strictEqual(text, "", `${name} holds the unlinked file's bytes`);
     }
     assert.strictEqual(await readAfterReopen(store, "s"), null);
+  });
+});
+
+describe("sizes no buffer can hold, on a file without a data file", () => {
+  // Past the spare pool, a file's bytes stay in memory until background
+  // work gives it a data file. A guest-chosen size the engine refuses to
+  // allocate must come back as an errno: an exception thrown inside an
+  // import would trap the guest.
+  const HUGE = 2 ** 52;
+
+  it("fd_pwrite at a huge offset reports NOSPC", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(sysWrite(w.h, file.fd, "x").errno, ESUCCESS);
+    // Reuse the iovec the write above left in guest memory.
+    const iovec = 256;
+    assert.strictEqual(
+      w.h.imports.fd_pwrite(file.fd, iovec, 1, BigInt(HUGE), 4096 + 8),
+      WASIAbi.WASI_ERRNO_NOSPC,
+    );
+    assert.strictEqual(sysSeekStart(w.h, file.fd), ESUCCESS);
+    assert.strictEqual(sysReadText(w.h, file.fd).text, "x");
+    await w.backend.close();
+  });
+
+  it("fd_filestat_set_size to a huge size reports NOSPC", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 0 });
+    const file = sysCreate(w.h, "pending");
+    assert.strictEqual(
+      w.h.imports.fd_filestat_set_size(file.fd, BigInt(HUGE)),
+      WASIAbi.WASI_ERRNO_NOSPC,
+    );
+    await w.backend.close();
   });
 });
