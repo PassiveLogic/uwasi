@@ -68,7 +68,11 @@ results and report storage failures by throwing `FSError(errno, cause?)`.
 The shared syscall boundary converts only that error type to a WASI errno;
 unexpected exceptions still propagate. A failed read is not reported as EOF,
 and a failed size lookup is not reported as an empty file. Link counts change
-only after a namespace operation succeeds.
+only after a namespace operation succeeds, except in `path_link`: it raises the
+source node's `nlink` before it calls `createChild`, so a backend without hard
+links can refuse a second name for an existing node, and lowers it again if the
+link fails. Every node but a directory carries `nlink`, symlinks and device
+nodes included.
 
 The error must come from the same uwasi module instance as the provider because
 recognition uses constructor identity. Avoid mixing ESM/CJS instances or duplicate

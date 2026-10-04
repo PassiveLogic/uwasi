@@ -271,7 +271,7 @@ skipped cases using the in-memory backend and an OPFS mock, not a real browser
 | `path_create_directory` | ✅ | Single level; parent must exist |
 | `path_filestat_get` | ✅ | `SYMLINK_FOLLOW` honored |
 | `path_filestat_set_times` | ✅ | Symlink-aware (lstat-level timestamps) |
-| `path_link` | ✅ | Memory FS: hard links with shared inode and `nlink` accounting; OPFS: `NOTSUP` (one name per file in the durable namespace record) |
+| `path_link` | ✅ | Memory FS: hard links with shared inode and `nlink` accounting; OPFS: `NOTSUP` for files and symlinks (one name per node in the durable namespace record) |
 | `path_open` | ✅ | Full `oflags`/`fdflags`/rights semantics; sandboxed path resolution |
 | `path_readlink` | ✅ | Silent truncation to the buffer, no NUL |
 | `path_remove_directory` | ✅ | `NOTEMPTY` on non-empty directories |

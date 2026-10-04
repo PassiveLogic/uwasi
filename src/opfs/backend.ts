@@ -966,13 +966,18 @@ export class OPFSBackend implements FSBackend {
 
   createChild(parent: DirectoryNode, name: string, node: FSNode): number {
     if (
-      node.type === "file" &&
-      (this.physByNode.has(node) ||
-        this.pendingIds.has(node) ||
-        this.known.has(node))
+      (node.type !== "dir" && node.nlink > 1) ||
+      (node.type === "file" &&
+        (this.physByNode.has(node) ||
+          this.pendingIds.has(node) ||
+          this.known.has(node)))
     ) {
-      // A second name for an existing file is a hard link; the namespace
-      // record maps ids to exactly one name (documented limitation).
+      // A second name for an existing file or symlink is a hard link; the
+      // namespace record maps ids to exactly one name, and stores each
+      // symlink name as a node of its own (documented limitation).
+      // `path_link` counts the new name in `nlink` first, which also
+      // catches a node seeded through the tree-builder that no record
+      // names yet.
       return FSErrno.NOTSUP;
     }
     try {

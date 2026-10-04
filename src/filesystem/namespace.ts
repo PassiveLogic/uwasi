@@ -10,6 +10,15 @@ interface NodeMeta {
 }
 
 /**
+ * Names linking a non-directory node, as `stat` reports them. `path_link`
+ * raises it for whatever node it links, so a backend can tell a second
+ * name for an existing node from a new one.
+ */
+interface LinkCount {
+  nlink: number;
+}
+
+/**
  * Represents a node in the file system that is a directory.
  */
 export interface DirectoryNode extends NodeMeta {
@@ -20,16 +29,15 @@ export interface DirectoryNode extends NodeMeta {
 /**
  * Represents a node in the file system that is a file.
  */
-export interface FileNode extends NodeMeta {
+export interface FileNode extends NodeMeta, LinkCount {
   readonly type: "file";
   content: Uint8Array;
-  nlink: number;
 }
 
 /**
  * Represents a symbolic link.
  */
-export interface SymlinkNode extends NodeMeta {
+export interface SymlinkNode extends NodeMeta, LinkCount {
   readonly type: "symlink";
   target: string;
 }
@@ -38,7 +46,8 @@ type CharacterDeviceNode = (
   | { readonly type: "character"; kind: "stdio"; entry: FdEntry }
   | { readonly type: "character"; kind: "devnull" }
 ) &
-  NodeMeta;
+  NodeMeta &
+  LinkCount;
 
 /**
  * Union type representing any node in the file system.
@@ -61,6 +70,12 @@ export function stampMeta<T extends object>(node: T): T & NodeMeta {
     meta.atim = now;
     meta.mtim = now;
     meta.ctim = now;
+  }
+  // Nodes built by hand, such as a symlink passed to `setNode`, may come
+  // without a link count.
+  const counted = node as { type?: string; nlink?: number };
+  if (counted.type !== "dir" && counted.nlink === undefined) {
+    counted.nlink = 1;
   }
   return meta;
 }
@@ -86,7 +101,7 @@ export function makeFile(content: Uint8Array): FileNode {
   return stampMeta({ type: "file" as const, content, nlink: 1 });
 }
 export function makeSymlink(target: string): SymlinkNode {
-  return stampMeta({ type: "symlink" as const, target });
+  return stampMeta({ type: "symlink" as const, target, nlink: 1 });
 }
 
 const SYMLOOP_MAX = 32;
@@ -213,7 +228,7 @@ export class MemoryFileSystem {
     this.ensureDir("/dev");
     this.setNode(
       "/dev/null",
-      stampMeta({ type: "character", kind: "devnull" }),
+      stampMeta({ type: "character", kind: "devnull", nlink: 1 }),
     );
 
     // Setup preopened directories

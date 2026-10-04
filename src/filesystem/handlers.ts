@@ -134,9 +134,9 @@ function statOf(
 } {
   let size = 0;
   let nlink = 1;
+  if (node.type !== "dir") nlink = node.nlink;
   if (node.type === "file") {
     size = backend.fileSize(node);
-    nlink = node.nlink;
   } else if (node.type === "symlink") {
     size = new TextEncoder().encode(node.target).byteLength;
   }
@@ -192,7 +192,7 @@ export function bindFSSyscalls(
 
   bindStdio(withStdio).forEach((entry, fd) => {
     files.set(fd, {
-      node: stampMeta({ type: "character", kind: "stdio", entry }),
+      node: stampMeta({ type: "character", kind: "stdio", entry, nlink: 1 }),
       position: 0,
       fdflags: 0,
       rightsBase:
@@ -697,14 +697,18 @@ export function bindFSSyscalls(
       if (target.trailingSlash) return WASIAbi.WASI_ERRNO_NOENT;
       if (target.node) return WASIAbi.WASI_ERRNO_EXIST;
       if (!target.parent || !target.name) return WASIAbi.WASI_ERRNO_NOENT;
-      const errno = backend.createChild(
-        target.parent,
-        target.name,
-        source.node,
-      );
-      if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (source.node.type === "file") source.node.nlink++;
-      return WASIAbi.WASI_ESUCCESS;
+      // Counted before the backend sees the node, so a backend without
+      // hard links can tell a second name from a new node by `nlink`.
+      // Undone unless the link succeeds, even if the backend throws.
+      const counted = source.node;
+      counted.nlink++;
+      let errno: number = WASIAbi.WASI_ERRNO_IO;
+      try {
+        errno = backend.createChild(target.parent, target.name, counted);
+      } finally {
+        if (errno !== WASIAbi.WASI_ESUCCESS) counted.nlink--;
+      }
+      return errno;
     },
 
     path_open: (
@@ -881,7 +885,7 @@ export function bindFSSyscalls(
         target.name,
       );
       if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (target.node !== null && target.node.type === "file") {
+      if (target.node !== null && target.node.type !== "dir") {
         target.node.nlink--;
       }
       return WASIAbi.WASI_ESUCCESS;
@@ -929,7 +933,7 @@ export function bindFSSyscalls(
       }
       const errno = backend.removeChild(resolved.parent, resolved.name);
       if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (resolved.node.type === "file") resolved.node.nlink--;
+      resolved.node.nlink--;
       return WASIAbi.WASI_ESUCCESS;
     },
 

@@ -15,6 +15,8 @@ import {
   sysMkdir,
   sysRename,
   sysUnlink,
+  sysSymlink,
+  sysLstat,
 } from "./syscall_harness.mjs";
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -379,6 +381,47 @@ describe("OPFSBackend", () => {
       WASIAbi.WASI_ERRNO_NOTSUP,
     );
     assert.strictEqual(sysStat(w.h, "alias").errno, WASIAbi.WASI_ERRNO_NOENT);
+    await w.backend.close();
+  });
+
+  it("hard links to a seeded file no record names yet are refused too", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    w.backend.fileSystem.addFile("/seeded", "payload");
+    assert.strictEqual(
+      sysLink(w.h, "seeded", "alias"),
+      WASIAbi.WASI_ERRNO_NOTSUP,
+    );
+    assert.strictEqual(sysStat(w.h, "alias").errno, WASIAbi.WASI_ERRNO_NOENT);
+    assert.strictEqual(
+      w.backend.fileSystem.lookup("/seeded").nlink,
+      1,
+      "a refused link is not counted",
+    );
+    await w.backend.close();
+  });
+
+  it("hard links to a symlink are refused, recorded or seeded", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    assert.strictEqual(sysSymlink(w.h, "target", "made"), ESUCCESS);
+    // Seeded through the tree-builder: no record names it yet.
+    w.backend.fileSystem.setNode("/seeded", {
+      type: "symlink",
+      target: "target",
+    });
+    for (const name of ["made", "seeded"]) {
+      assert.strictEqual(
+        sysLink(w.h, name, `${name}-alias`),
+        WASIAbi.WASI_ERRNO_NOTSUP,
+        name,
+      );
+      assert.strictEqual(
+        sysLstat(w.h, `${name}-alias`).errno,
+        WASIAbi.WASI_ERRNO_NOENT,
+      );
+      assert.strictEqual(sysLstat(w.h, name).nlink, 1, "not counted");
+    }
     await w.backend.close();
   });
 

@@ -174,6 +174,50 @@ describe("fd.bindFSSyscalls backend seam", () => {
     );
     assert.ok(backend.calls.includes("removeChild"));
   });
+
+  it("path_link undoes its nlink count when createChild throws", () => {
+    class ThrowingLinkBackend extends MemoryFSBackend {
+      createChild(parent, name, node) {
+        if (node.type === "file" && node.nlink > 1) {
+          throw new Error("backend bug");
+        }
+        return super.createChild(parent, name, node);
+      }
+    }
+    const h = makeSeam(new ThrowingLinkBackend());
+    assert.strictEqual(h.imports.fd_close(openFile(h, "src")), ESUCCESS);
+    const encoder = new TextEncoder();
+    const from = encoder.encode("src");
+    const to = encoder.encode("dst");
+    h.bytes.set(from, PATH_PTR);
+    h.bytes.set(to, PATH_PTR + 64);
+    assert.throws(
+      () =>
+        h.imports.path_link(
+          PREOPEN_FD,
+          0,
+          PATH_PTR,
+          from.length,
+          PREOPEN_FD,
+          PATH_PTR + 64,
+          to.length,
+        ),
+      /backend bug/,
+    );
+    // path_filestat_get: nlink is the u64 at offset 24 of the filestat.
+    h.bytes.set(from, PATH_PTR);
+    assert.strictEqual(
+      h.imports.path_filestat_get(
+        PREOPEN_FD,
+        0,
+        PATH_PTR,
+        from.length,
+        OUT_PTR,
+      ),
+      ESUCCESS,
+    );
+    assert.strictEqual(h.view.getBigUint64(OUT_PTR + 24, true), 1n);
+  });
 });
 
 describe("MemoryFileSystem directory entries", () => {
@@ -201,6 +245,24 @@ describe("MemoryFileSystem directory entries", () => {
         .sort(),
       [...names, "__defineGetter__"].sort(),
     );
+  });
+});
+
+describe("hard links to a symlink", () => {
+  it("count both names on the one node", async () => {
+    const { bindImports, sysSymlink, sysLink, sysLstat, sysUnlink } =
+      await import("./syscall_harness.mjs");
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const h = bindImports(new MemoryFSBackend(), fs);
+    assert.strictEqual(sysSymlink(h, "target", "l"), ESUCCESS);
+    assert.strictEqual(sysLstat(h, "l").nlink, 1);
+    assert.strictEqual(sysLink(h, "l", "l2"), ESUCCESS);
+    const [first, second] = [sysLstat(h, "l"), sysLstat(h, "l2")];
+    assert.strictEqual(first.ino, second.ino);
+    assert.strictEqual(first.nlink, 2);
+    assert.strictEqual(second.nlink, 2);
+    assert.strictEqual(sysUnlink(h, "l2"), ESUCCESS);
+    assert.strictEqual(sysLstat(h, "l").nlink, 1);
   });
 });
 
