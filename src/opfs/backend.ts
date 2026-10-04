@@ -377,6 +377,28 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   /**
+   * Apply a namespace change to `dirs` with `apply` and record it. If the
+   * record fails, `dirs` get back exactly the entries they had, in their
+   * order too: insertion order is the listing order, which a reopen
+   * rebuilds from the record. Rethrows the failure.
+   */
+  private recordChange(dirs: DirectoryNode[], apply: () => void): void {
+    const saved = dirs.map((dir) =>
+      Object.assign(Object.create(null), dir.entries),
+    );
+    apply();
+    try {
+      this.snapshotFlush();
+    } catch (error) {
+      dirs.forEach((dir, i) => {
+        for (const name of Object.keys(dir.entries)) delete dir.entries[name];
+        Object.assign(dir.entries, saved[i]);
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Serialize the live node tree into the older record slot and flush it.
    * This is the single durability point for every namespace change. It
    * also adopts any reachable file the backend has not persisted yet
@@ -953,13 +975,11 @@ export class OPFSBackend implements FSBackend {
       // record maps ids to exactly one name (documented limitation).
       return FSErrno.NOTSUP;
     }
-    const previous = parent.entries[name];
-    parent.entries[name] = node;
     try {
-      this.snapshotFlush();
+      this.recordChange([parent], () => {
+        parent.entries[name] = node;
+      });
     } catch (error) {
-      if (previous !== undefined) parent.entries[name] = previous;
-      else delete parent.entries[name];
       return this.errnoOf(error);
     }
     return FSErrno.SUCCESS;
@@ -974,17 +994,17 @@ export class OPFSBackend implements FSBackend {
       const errno = this.tombstone(node);
       if (errno !== FSErrno.SUCCESS) return errno;
     }
-    delete parent.entries[name];
     try {
       // Step 2: record the namespace without the entry.
-      this.snapshotFlush();
+      this.recordChange([parent], () => {
+        delete parent.entries[name];
+      });
     } catch (error) {
-      // Roll the in-memory namespace back so the name keeps resolving.
-      // The content may already be gone, leaving the name mapped to an
-      // empty file - the documented crash window of step 1.
-      if (node !== undefined) {
-        parent.entries[name] = node;
-        if (node.type === "file") this.pendingTombstones.delete(node);
+      // The name keeps resolving. The content may already be gone,
+      // leaving the name mapped to an empty file - the documented crash
+      // window of step 1.
+      if (node !== undefined && node.type === "file") {
+        this.pendingTombstones.delete(node);
       }
       return this.errnoOf(error);
     }
@@ -999,17 +1019,18 @@ export class OPFSBackend implements FSBackend {
   ): number {
     const node = fromParent.entries[fromName];
     const replaced = toParent.entries[toName];
-    delete fromParent.entries[fromName];
-    toParent.entries[toName] = node;
     try {
       // Record the new mapping first, so that a crash here shows either
       // the old target or the renamed node at the destination, never a
       // truncated file in between.
-      this.snapshotFlush();
+      this.recordChange(
+        fromParent === toParent ? [fromParent] : [fromParent, toParent],
+        () => {
+          delete fromParent.entries[fromName];
+          toParent.entries[toName] = node;
+        },
+      );
     } catch (error) {
-      if (replaced !== undefined) toParent.entries[toName] = replaced;
-      else delete toParent.entries[toName];
-      fromParent.entries[fromName] = node;
       return this.errnoOf(error);
     }
     if (

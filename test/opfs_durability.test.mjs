@@ -7,10 +7,12 @@ import {
   bindImports,
   sysClose,
   sysCreate,
+  sysMkdir,
   sysOpen,
   sysStat,
   sysSync,
   sysReadText,
+  sysRename,
   sysUnlink,
   sysWrite,
 } from "./syscall_harness.mjs";
@@ -384,5 +386,41 @@ describe("opening a store survives storage failures", () => {
       }
       access.close();
     }
+  });
+});
+
+describe("failed namespace syscalls", () => {
+  it("keep the directory listing order", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 4 });
+    assert.strictEqual(sysMkdir(w.h, "d"), ESUCCESS);
+    for (const name of ["a", "b", "c", "d/x", "d/y"]) {
+      assert.strictEqual(sysClose(w.h, sysCreate(w.h, name).fd), ESUCCESS);
+    }
+    const before = {
+      "/": listNames(w.backend),
+      "/d": listNames(w.backend, "/d"),
+    };
+    const failing = [
+      ["unlink", () => sysUnlink(w.h, "a")],
+      ["rename", () => sysRename(w.h, "a", "z")],
+      ["rename over", () => sysRename(w.h, "a", "c")],
+      ["rename across", () => sysRename(w.h, "d/x", "b")],
+      ["mkdir", () => sysMkdir(w.h, "new")],
+    ];
+    for (const [what, call] of failing) {
+      const fault = store.injectFault({ op: "write", match: ".uwasi.meta." });
+      assert.notStrictEqual(call(), ESUCCESS, `${what} should fail`);
+      assert.strictEqual(fault.fired, 1, what);
+      for (const dir of ["/", "/d"]) {
+        assert.deepStrictEqual(listNames(w.backend, dir), before[dir], what);
+      }
+    }
+    await w.backend.close();
+    const reopened = await makeWorker(store, { spareFiles: 4 });
+    for (const dir of ["/", "/d"]) {
+      assert.deepStrictEqual(listNames(reopened.backend, dir), before[dir]);
+    }
+    await reopened.backend.close();
   });
 });
