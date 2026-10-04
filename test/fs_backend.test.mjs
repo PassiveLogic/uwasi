@@ -203,3 +203,50 @@ describe("MemoryFileSystem directory entries", () => {
     );
   });
 });
+
+describe("path_rename of a directory", () => {
+  it("refuses to move it into its own subtree", async () => {
+    const { bindImports, sysMkdir, sysRename, sysStat } = await import(
+      "./syscall_harness.mjs"
+    );
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const h = bindImports(new MemoryFSBackend(), fs);
+    assert.strictEqual(sysMkdir(h, "a"), ESUCCESS);
+    assert.strictEqual(sysMkdir(h, "a/b"), ESUCCESS);
+    for (const target of ["a/c", "a/b/c"]) {
+      assert.strictEqual(sysRename(h, "a", target), WASIAbi.WASI_ERRNO_INVAL);
+    }
+    // The same move with the target reached through a directory fd.
+    const dirPath = new TextEncoder().encode("a/b");
+    h.bytes.set(dirPath, 0);
+    const dirRights = ALL_RIGHTS ^ BigInt(1 << 6); // no FD_WRITE
+    assert.strictEqual(
+      h.imports.path_open(
+        PREOPEN_FD,
+        0,
+        0,
+        dirPath.length,
+        WASIAbi.WASI_OFLAGS_DIRECTORY,
+        dirRights,
+        dirRights,
+        0,
+        4096,
+      ),
+      ESUCCESS,
+    );
+    const inner = { fd: h.view.getUint32(4096, true) };
+    const from = new TextEncoder().encode("a");
+    const to = new TextEncoder().encode("c");
+    h.bytes.set(from, 0);
+    h.bytes.set(to, 128);
+    assert.strictEqual(
+      h.imports.path_rename(PREOPEN_FD, 0, from.length, inner.fd, 128, 1),
+      WASIAbi.WASI_ERRNO_INVAL,
+    );
+    assert.strictEqual(sysStat(h, "a/b").errno, ESUCCESS);
+    // Moving a directory up out of itself is fine.
+    assert.strictEqual(sysRename(h, "a/b", "b"), ESUCCESS);
+    assert.strictEqual(sysRename(h, "a", "b/a"), ESUCCESS);
+    assert.strictEqual(sysStat(h, "b/a").errno, ESUCCESS);
+  });
+});

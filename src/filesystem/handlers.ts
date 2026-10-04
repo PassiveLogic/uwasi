@@ -104,6 +104,20 @@ function filetypeOf(node: FSNode): number {
   }
 }
 
+/** Whether `dir` is `root` itself or lies anywhere inside its subtree. */
+function isWithin(dir: DirectoryNode, root: DirectoryNode): boolean {
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current === dir) return true;
+    for (const name of Object.keys(current.entries)) {
+      const child = current.entries[name];
+      if (child.type === "dir") pending.push(child);
+    }
+  }
+  return false;
+}
+
 const MEMFS_DEV = BigInt(1);
 
 function statOf(
@@ -843,6 +857,13 @@ export function bindFSSyscalls(
         return WASIAbi.WASI_ERRNO_NOTDIR;
       }
       if (target.node === source.node) return WASIAbi.WASI_ESUCCESS;
+      // Moving a directory into its own subtree would detach it into a
+      // cycle no path reaches. The target's directory may have been
+      // reached through another fd or a symlink, so search the subtree
+      // rather than compare paths.
+      if (source.node.type === "dir" && isWithin(target.parent, source.node)) {
+        return WASIAbi.WASI_ERRNO_INVAL;
+      }
       if (target.node) {
         if (source.node.type === "dir") {
           if (target.node.type !== "dir") return WASIAbi.WASI_ERRNO_NOTDIR;

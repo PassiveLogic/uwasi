@@ -2,6 +2,7 @@
 // successful syscall promised must survive a crash, whatever failed before
 // it.
 import { OPFSBackend } from "uwasi/opfs";
+import { WASIAbi } from "../lib/esm/abi.js";
 import { MockOPFS } from "./opfs_mock.mjs";
 import {
   bindImports,
@@ -422,5 +423,22 @@ describe("failed namespace syscalls", () => {
       assert.deepStrictEqual(listNames(reopened.backend, dir), before[dir]);
     }
     await reopened.backend.close();
+  });
+});
+
+describe("path_rename of a directory", () => {
+  it("refuses to move it into its own subtree", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store, { spareFiles: 2 });
+    assert.strictEqual(sysMkdir(w.h, "a"), ESUCCESS);
+    assert.strictEqual(sysMkdir(w.h, "a/b"), ESUCCESS);
+    assert.strictEqual(sysClose(w.h, sysCreate(w.h, "a/b/f").fd), ESUCCESS);
+    assert.strictEqual(sysRename(w.h, "a", "a/b/c"), WASIAbi.WASI_ERRNO_INVAL);
+    assert.strictEqual(sysStat(w.h, "a/b/f").errno, ESUCCESS);
+    store.simulateCrash();
+    const fresh = await makeWorker(store, { spareFiles: 2 });
+    assert.deepStrictEqual(listNames(fresh.backend), ["a"]);
+    assert.strictEqual(sysStat(fresh.h, "a/b/f").errno, ESUCCESS);
+    await fresh.backend.close();
   });
 });
