@@ -47,6 +47,16 @@ export function fsBackendContractSuite(name, createFixture) {
       assert.strictEqual(backend.readAt(node, new Uint8Array(0), 0), 0);
     });
 
+    it("writeAt with no data leaves the size, even past end of file", async () => {
+      const { backend, makeFileNode } = await createFixture();
+      const node = makeFileNode(new Uint8Array([1, 2, 3]));
+      assert.strictEqual(
+        backend.writeAt(node, new Uint8Array(0), 100),
+        ESUCCESS,
+      );
+      assert.strictEqual(backend.fileSize(node), 3);
+    });
+
     it("writeAt overwrites in place without resizing", async () => {
       const { backend, makeFileNode } = await createFixture();
       const node = makeFileNode(new Uint8Array([1, 1, 1, 1]));

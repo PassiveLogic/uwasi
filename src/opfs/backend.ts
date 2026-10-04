@@ -1312,6 +1312,8 @@ export class OPFSBackend implements FSBackend {
   }
 
   writeAt(node: FileNode, data: Uint8Array, offset: number): number {
+    // Writing nothing changes nothing, not even the size past EOF.
+    if (data.byteLength === 0) return FSErrno.SUCCESS;
     const id = this.physByNode.get(node);
     if (id === undefined) {
       // Not yet persisted (tree-builder seeded): plain in-memory write;

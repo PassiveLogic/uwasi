@@ -25,8 +25,14 @@ export interface FSBackend {
    */
   readAt(node: FileNode, buf: Uint8Array, offset: number): number;
   /**
-   * Write `data` at `offset`, extending the file (zero-filling any gap) if
-   * it ends past EOF. Returns an errno.
+   * Write `data` at `offset`. Returns an errno. A write that ends past EOF
+   * must extend the file itself, zero-filling any gap: the syscall layer
+   * does not resize it first. Empty `data` leaves the file as it is, even
+   * at an offset past EOF. A failed write may still have changed the
+   * file: extended it, or written part of `data`. `fd_write` and
+   * `fd_pwrite` call this once per iovec, in order, so when a later one
+   * fails, the earlier ones stay written while the syscall reports only
+   * the errno.
    */
   writeAt(node: FileNode, data: Uint8Array, offset: number): number;
   /** Truncate or zero-fill-extend the file to `size`. Returns an errno. */

@@ -426,6 +426,27 @@ describe("OPFSBackend", () => {
     await w.backend.close();
   });
 
+  it("an empty iovec past EOF does not grow a file", async () => {
+    const store = new MockOPFS();
+    const w = await makeWorker(store);
+    const h = w.h;
+    // fd_write with one empty iovec at a cursor past the end.
+    const file = sysCreate(h, "empty");
+    assert.strictEqual(h.imports.fd_seek(file.fd, 100n, 0, 5000), ESUCCESS);
+    assert.strictEqual(sysWrite(h, file.fd, "").errno, ESUCCESS);
+    assert.strictEqual(sysStat(h, "empty").size, 0);
+    // fd_pwrite with one empty iovec far past the end.
+    assert.strictEqual(sysWrite(h, file.fd, "abc").errno, ESUCCESS);
+    h.view.setUint32(256, 512, true);
+    h.view.setUint32(260, 0, true);
+    assert.strictEqual(
+      h.imports.fd_pwrite(file.fd, 256, 1, 1000n, 4096),
+      ESUCCESS,
+    );
+    assert.strictEqual(sysStat(h, "empty").size, 103);
+    await w.backend.close();
+  });
+
   it("listChildren order is stable across re-init", async () => {
     const store = new MockOPFS();
     const w1 = await makeWorker(store);
