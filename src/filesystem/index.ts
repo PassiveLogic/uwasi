@@ -27,7 +27,7 @@ export const FSErrno = {
 } as const;
 
 /** Bind a ready synchronous backend and its live namespace to WASI. */
-export function useFileSystem(useOptions: {
+export function useFS(useOptions: {
   withBackend: FSBackend;
   withFileSystem: MemoryFileSystem;
   withStdio?: StdioOptions;

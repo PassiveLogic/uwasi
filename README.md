@@ -127,7 +127,7 @@ const wasi = new WASI({
 });
 ```
 
-`useMemoryFS` accepts the same option through `withStdio`. There, the preopened directories take fd 3 upward, because wasi-libc stops looking for preopens at the first fd that isn't one. Extra fds must be numbered above them, e.g. from 4 with the default single `/` preopen; a clash throws a `RangeError`.
+`useFS`, `useMemoryFS`, and `useOPFS` accept the same option through `withStdio`. There, the preopened directories take fd 3 upward, because wasi-libc stops looking for preopens at the first fd that isn't one. Extra fds must be numbered above them, e.g. from 4 with the default single `/` preopen; a clash throws a `RangeError`.
 
 ### With `poll_oneoff` and `sched_yield` enabled
 
@@ -249,14 +249,20 @@ it cannot read, such as one a later version wrote.
 ### Custom storage backends
 
 `uwasi/filesystem` exposes the synchronous `FSBackend` contract, namespace
-types, storage errno constants, and `useFileSystem` provider. It keeps WASI
+types, storage errno constants, and the `useFS` provider. It keeps WASI
 path resolution, descriptors, rights checks, and guest-memory handling out
 of storage backends. `uwasi/opfs` exposes the existing OPFS implementation.
 OPFS is available only through the `uwasi/opfs` public subpath. Root imports
 of `WASI` and `useAll` do not load OPFS code in either ESM or CommonJS;
 `useAll()` continues to select memory storage. Existing fork consumers must
 move `OPFSBackend` and `useOPFS` imports from `uwasi` to `uwasi/opfs`, keeping
-`WASI` imported from `uwasi` as shown above. Non-OPFS root exports are unchanged.
+`WASI` imported from `uwasi` as shown above.
+
+`useFS` is the same provider exported from both `uwasi` and `uwasi/filesystem`.
+It takes `{ withBackend, withFileSystem, withStdio? }`, replacing the root's
+previous empty `useFS({ fs })` placeholder and the generic `useFileSystem`
+export. `useFileSystem` has been removed without an alias; rename calls to
+`useFS`. Both `useMemoryFS` and `useOPFS` delegate to this shared provider.
 
 Everything remains in one npm package. The OPFS source is isolated so it
 can later move into a separate package without copying syscall handling.
