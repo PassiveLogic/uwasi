@@ -24,6 +24,54 @@ import assert from "node:assert";
 
 const ESUCCESS = 0;
 
+describe("OPFS extraFds", () => {
+  it("routes character-device IO and skips reserved descriptors", async () => {
+    const backend = await OPFSBackend.create(new MockOPFS().root);
+    try {
+      const written = [];
+      const input = ["config"];
+      const memory = new ArrayBuffer(65536);
+      const view = new DataView(memory);
+      const h = {
+        view,
+        bytes: new Uint8Array(memory),
+        imports: useOPFS({
+          withBackend: backend,
+          withStdio: {
+            extraFds: {
+              4: { write: (text) => written.push(text) },
+              6: { read: () => input.shift() || "" },
+            },
+          },
+        })({}, new WASIAbi(), () => view),
+      };
+      assert.strictEqual(sysWrite(h, 4, "report").errno, ESUCCESS);
+      assert.deepStrictEqual(written, ["report"]);
+      assert.strictEqual(sysReadText(h, 6).text, "config");
+      assert.deepStrictEqual(sysCreate(h, "a"), { errno: ESUCCESS, fd: 5 });
+      assert.deepStrictEqual(sysCreate(h, "b"), { errno: ESUCCESS, fd: 7 });
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("rejects a character-device descriptor reserved for a preopen", async () => {
+    const backend = await OPFSBackend.create(new MockOPFS().root);
+    try {
+      assert.throws(
+        () =>
+          useOPFS({
+            withBackend: backend,
+            withStdio: { extraFds: { 3: { read: () => "" } } },
+          })({}, new WASIAbi(), () => new DataView(new ArrayBuffer(65536))),
+        RangeError,
+      );
+    } finally {
+      await backend.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Sanity checks for the mock itself: the journal-lifecycle tests are only as
 // strong as these semantics.

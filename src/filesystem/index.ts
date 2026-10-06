@@ -14,7 +14,7 @@ export {
   SymlinkNode,
   MemoryFileSystem,
 } from "./namespace.js";
-export { StdioOptions } from "./stdio.js";
+export { CharacterDeviceHandler, StdioOptions } from "./stdio.js";
 
 /** Storage errors returned by backends, using WASI preview1 errno values. */
 export const FSErrno = {

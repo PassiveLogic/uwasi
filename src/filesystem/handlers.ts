@@ -210,6 +210,11 @@ export function bindFSSyscalls(
   for (const preopenPath of fileSystem.getPreopenPaths()) {
     const node = fileSystem.lookup(preopenPath);
     if (node && node.type === "dir") {
+      if (files.has(nextFd)) {
+        throw new RangeError(
+          `extraFds must be above the preopened directories, got ${nextFd}, which is taken by preopen "${preopenPath}"`,
+        );
+      }
       files.set(nextFd, {
         node,
         position: 0,
@@ -797,6 +802,7 @@ export function bindFSSyscalls(
         if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
       }
       const typeMask = node.type === "dir" ? DIRECTORY_RIGHTS : FILE_RIGHTS;
+      while (files.has(nextFd)) nextFd++;
       files.set(nextFd, {
         node,
         position: 0,

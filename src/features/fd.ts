@@ -6,6 +6,7 @@ export {
   lineBuffered,
   useStdio,
   StdioOptions,
+  CharacterDeviceHandler,
 } from "../filesystem/stdio.js";
 export {
   MemoryFileSystem,
