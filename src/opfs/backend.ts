@@ -8,6 +8,21 @@ import {
   FSErrno,
   FSError,
 } from "../filesystem/index.js";
+import {
+  ByteWriter,
+  NsRecord,
+  Op,
+  ROOT_DIR_ID,
+  Snapshot,
+  UnknownFormatError,
+  beginSnapshot,
+  decodeLog,
+  decodeSnapshot,
+  encodeFrame,
+  encodeLogHeader,
+  encodeRecord,
+  finishSnapshot,
+} from "./format.js";
 
 /**
  * The slice of the OPFS API surface the backend uses, typed structurally so
@@ -48,73 +63,40 @@ export interface OPFSDirectoryHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Durable metadata format
+// Store layout
 // ---------------------------------------------------------------------------
 
-/** Serialized namespace: a tree of names over physical file ids. */
-type MetaDir = { d: { [name: string]: MetaEntry } };
-type MetaEntry = MetaDir | { f: number } | { l: string };
-type MetaPayload = { gen: number; next: number; root: MetaDir };
-
 const META_NAMES = [".uwasi.meta.0", ".uwasi.meta.1"];
+/** The change log; named under `.uwasi.meta.` as part of the record. */
+const LOG_NAME = ".uwasi.meta.log";
+/**
+ * Compact once the log outgrows both this floor and `LOG_RATIO` times the
+ * last snapshot. A snapshot costs time proportional to the namespace, and
+ * it comes due only after proportionally many appends, so recording a
+ * namespace change costs amortized constant time. (The syscall making the
+ * change may cost more: renaming a directory searches its subtree.)
+ */
+const MIN_LOG_BYTES = 64 * 1024;
+const LOG_RATIO = 2;
 const DATA_PREFIX = ".uwasi.data.";
-const META_MAGIC = new Uint8Array([0x55, 0x57, 0x4d, 0x31]); // "UWM1"
-const META_HEADER = 12; // magic + u32 body length + u32 FNV-1a of the body
 
 function dataName(id: number): string {
   return DATA_PREFIX + id;
 }
 
-function fnv1a(bytes: Uint8Array): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < bytes.length; i++) {
-    hash ^= bytes[i];
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-function encodeMeta(payload: MetaPayload): Uint8Array {
-  const body = new TextEncoder().encode(JSON.stringify(payload));
-  const buffer = new Uint8Array(META_HEADER + body.byteLength);
-  const view = new DataView(buffer.buffer);
-  buffer.set(META_MAGIC, 0);
-  view.setUint32(4, body.byteLength, true);
-  view.setUint32(8, fnv1a(body), true);
-  buffer.set(body, META_HEADER);
+function readAll(handle: OPFSSyncAccessHandle): Uint8Array {
+  const buffer = new Uint8Array(handle.getSize());
+  if (buffer.byteLength > 0) handle.read(buffer, { at: 0 });
   return buffer;
 }
 
-/** Parse a meta slot; `null` for an empty, torn or foreign slot. */
-function decodeMeta(handle: OPFSSyncAccessHandle): MetaPayload | null {
-  const size = handle.getSize();
-  if (size < META_HEADER) return null;
-  const buffer = new Uint8Array(size);
-  handle.read(buffer, { at: 0 });
-  for (let i = 0; i < META_MAGIC.length; i++) {
-    if (buffer[i] !== META_MAGIC[i]) return null;
-  }
-  const view = new DataView(buffer.buffer);
-  const length = view.getUint32(4, true);
-  if (META_HEADER + length > size) return null;
-  const body = buffer.subarray(META_HEADER, META_HEADER + length);
-  if (fnv1a(body) !== view.getUint32(8, true)) return null;
-  try {
-    const payload = JSON.parse(new TextDecoder().decode(body));
-    if (
-      typeof payload !== "object" ||
-      payload === null ||
-      typeof payload.gen !== "number" ||
-      typeof payload.next !== "number" ||
-      typeof payload.root !== "object"
-    ) {
-      return null;
-    }
-    return payload as MetaPayload;
-  } catch {
-    return null;
-  }
-}
+/** Live state while records rebuild the namespace at `init`. */
+type ReplayState = {
+  dirs: Map<number, DirectoryNode>;
+  files: Map<number, FileNode>;
+  maxDir: number;
+  maxFile: number;
+};
 
 const MAX_FILE_SIZE = Number.MAX_SAFE_INTEGER;
 
@@ -155,6 +137,45 @@ function involvesDevice(node: FSNode | undefined): boolean {
 }
 
 /**
+ * OPFS handle operations in flight at once. Each is an async round trip
+ * to the browser's storage backend; issuing them together overlaps that
+ * latency, and the bound keeps a large store from flooding it.
+ */
+const HANDLE_CONCURRENCY = 32;
+
+/**
+ * Run `task` over `items`, at most `HANDLE_CONCURRENCY` at a time. After
+ * the first failure no new task starts; the ones in flight finish (their
+ * side effects, such as recording an acquired handle, still happen), then
+ * the first failure is thrown.
+ */
+async function forEachConcurrently<T>(
+  items: T[],
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  const state = { next: 0, failed: false, error: undefined as unknown };
+  const worker = async (): Promise<void> => {
+    while (!state.failed && state.next < items.length) {
+      const item = items[state.next++];
+      try {
+        await task(item);
+      } catch (error) {
+        if (!state.failed) {
+          state.failed = true;
+          state.error = error;
+        }
+      }
+    }
+  };
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < Math.min(HANDLE_CONCURRENCY, items.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  if (state.failed) throw state.error;
+}
+
+/**
  * Write all of `data` at `at`. OPFS reports partial writes (e.g. under
  * quota pressure) only through the return value; a short write must never
  * pass as success, so it becomes a `RangeError` - which `errnoOf` maps to
@@ -184,10 +205,13 @@ function writeFully(
  * - `.uwasi.data.<id>`: one content file per guest file, each held open
  *   through a sync access handle for the backend's whole life. Releasing a
  *   handle is unsafe, because re-acquiring one is async.
- * - `.uwasi.meta.0/1`: the namespace record mapping guest names to data
- *   file ids, flushed on every namespace change, alternating between the
- *   two slots with a generation number and a checksum, so a torn write
- *   loses at most the in-flight change.
+ * - `.uwasi.meta.0/1`: namespace snapshots mapping guest names to data
+ *   file ids, alternating between the two slots with a generation number
+ *   and a checksum, so a torn snapshot falls back to the previous one.
+ * - `.uwasi.meta.log`: the change log on top of the newest snapshot. Each
+ *   namespace change appends and flushes one record, so its cost does not
+ *   grow with the namespace; the log is folded into a fresh snapshot once
+ *   it outgrows the last one. A torn append loses at most that change.
  * - a bounded pool of spare data files with open handles, so creating a
  *   guest file is a synchronous claim.
  *
@@ -221,8 +245,49 @@ export class OPFSBackend implements FSBackend {
   public fileSystem!: MemoryFileSystem;
 
   private metaHandles: OPFSSyncAccessHandle[] = [];
+  /** Generation of the newest snapshot known durable: the log builds on it. */
   private generation = 0;
+  /**
+   * The highest generation any slot may hold. A failed snapshot write can
+   * leave a complete snapshot in its slot that a later flush (or the
+   * storage itself) makes durable, so its generation is not used again
+   * in this session. `create()` restarts the count from the generation
+   * it loaded, which may reuse a failed one's; that is harmless, since a
+   * slot it did not load is torn or older, and init's own snapshot
+   * overwrites it.
+   */
+  private attemptedGeneration = 0;
   private nextId = 0;
+  /**
+   * Directory node -> its id in the namespace records. Ids are assigned
+   * when a directory is first recorded and never reused. A directory that
+   * left the tree (removed, or moved into one that was) keeps its id only
+   * until the next snapshot, which does not record it: replay would drop
+   * any later record naming that id, such as the rename of a file the
+   * guest moves out of it through an fd it kept. Changes there take a
+   * snapshot instead.
+   */
+  private dirIds = new WeakMap<DirectoryNode, number>();
+  private nextDirId = ROOT_DIR_ID + 1;
+  /** Reused across snapshots to avoid regrowing the encode buffer. */
+  private encoder = new ByteWriter();
+  private snapshotBytes = 0;
+  private logHandle!: OPFSSyncAccessHandle;
+  private logWriter = new ByteWriter(64);
+  /**
+   * When the log is due for compaction (see `MIN_LOG_BYTES`). Tests
+   * shrink it to reach compaction in short runs; it is not an option, and
+   * hosts must not rely on it.
+   */
+  private compactAt = { minBytes: MIN_LOG_BYTES, ratio: LOG_RATIO };
+  /** Offset just past the last durable frame: where the next one goes. */
+  private logEnd = 0;
+  /**
+   * The log does not build on the current snapshot (its reset failed after
+   * a compaction), so changes are recorded by full snapshots until a
+   * compaction resets it.
+   */
+  private logStale = true;
   /** Guest file node -> data-file id, for every persisted file. */
   private physByNode = new Map<FileNode, number>();
   /** Data-file id -> its always-open sync access handle. */
@@ -246,12 +311,14 @@ export class OPFSBackend implements FSBackend {
    */
   private pendingIds = new Map<FileNode, number>();
   /**
-   * File nodes a durable namespace record names. A node joins only once a
-   * record naming it is flushed: an id alone proves nothing, since `adopt`
-   * hands one out before the record that would name it is written, and
-   * that write can fail. Hard-link detection and `openFile` rely on it.
+   * File and symlink nodes a durable namespace record names (directories
+   * have `dirIds`). A node joins only once a record naming it is flushed:
+   * an id alone proves nothing, since `adopt` hands one out before the
+   * record that would name it is written, and that write can fail.
+   * Hard-link detection, `openFile` and the choice between a log record
+   * and a snapshot rely on it.
    */
-  private known = new WeakSet<FileNode>();
+  private known = new WeakSet<FileNode | SymlinkNode>();
   private openCounts = new Map<FileNode, number>();
   /** Unlinked-but-open files awaiting content destruction at last close. */
   private pendingTombstones = new Set<FileNode>();
@@ -276,8 +343,16 @@ export class OPFSBackend implements FSBackend {
       /** Guest preopen directories, as for `MemoryFileSystem`. */
       preopens?: { [guestPath: string]: string };
       /**
-       * Spare data files to keep pre-created: the maximum number of
-       * net-new guest files creatable within one synchronous burst.
+       * Spare data files to keep pre-created (default 16): the number of
+       * files one guest call can back with a data file right away, so
+       * `fd_sync` works. Files past it keep their content in memory until
+       * background work creates their data files, which runs only between
+       * guest calls; see `settle()`. Each spare holds an open sync access
+       * handle, so a larger pool costs open time. Size it to the most
+       * spares one guest call claims: one per file it creates or seeded
+       * file it first opens, one per unpersisted seeded file a snapshot
+       * takes along, and one per failed create, whose data file waits in
+       * quarantine until the next snapshot.
        */
       spareFiles?: number;
     } = {},
@@ -312,111 +387,216 @@ export class OPFSBackend implements FSBackend {
     }
 
     // Read both namespace-record slots; the highest intact generation wins.
-    let meta: MetaPayload | null = null;
+    // A slot this version cannot read stops the open before anything is
+    // changed (see `readSlot`).
+    let snapshot: Snapshot | null = null;
     for (const name of META_NAMES) {
       const fileHandle = await this.store.getFileHandle(name, { create: true });
       const handle = await fileHandle.createSyncAccessHandle();
       this.metaHandles.push(handle);
-      const slot = decodeMeta(handle);
-      if (slot && (!meta || slot.gen > meta.gen)) meta = slot;
+      const slot = this.readSlot(name, handle);
+      if (slot && (!snapshot || slot.gen > snapshot.gen)) snapshot = slot;
     }
-    this.generation = meta ? meta.gen : 0;
-    // Ids may have been handed out after the record was last written
-    // (background pool refills are not snapshotted); never reuse one.
-    this.nextId = Math.max(meta ? meta.next : 0, maxSeenId + 1);
+    this.generation = snapshot ? snapshot.gen : 0;
+    this.attemptedGeneration = this.generation;
 
-    // Rebuild the guest namespace from the record alone. Data files the
-    // record does not reference belong to unlinked files, so they stay
+    // Rebuild the guest namespace from the records alone. Data files the
+    // records do not reference belong to unlinked files, so they stay
     // invisible to the guest whatever bytes they still hold.
     this.fileSystem = new MemoryFileSystem(preopens);
-    if (meta) this.graft(meta.root, "");
+    const root = this.fileSystem.lookup("/") as DirectoryNode;
+    this.dirIds.set(root, ROOT_DIR_ID);
+    const replay: ReplayState = {
+      dirs: new Map([[ROOT_DIR_ID, root]]),
+      files: new Map(),
+      maxDir: ROOT_DIR_ID,
+      maxFile: -1,
+    };
+    for (const record of snapshot ? snapshot.records : []) {
+      this.applyRecord(record, replay);
+    }
+    const logFile = await this.store.getFileHandle(LOG_NAME, { create: true });
+    this.logHandle = await logFile.createSyncAccessHandle();
+    let logged: NsRecord[] | null;
+    try {
+      logged = decodeLog(readAll(this.logHandle), snapshot && snapshot.gen);
+    } catch (error) {
+      if (!(error instanceof UnknownFormatError)) throw error;
+      throw new Error(
+        `uwasi: ${LOG_NAME} holds a namespace log this version does not understand (${error.message}); refusing to open the store rather than discard it`,
+      );
+    }
+    for (const record of logged ?? []) this.applyRecord(record, replay);
+    // Ids may have been handed out after the records were last written
+    // (background pool refills are not recorded); never reuse one.
+    this.nextId = Math.max(maxSeenId, replay.maxFile) + 1;
+    this.nextDirId = replay.maxDir + 1;
 
     // Claim every referenced data file's handle for life.
-    for (const [, id] of this.physByNode) {
-      let fileHandle = dataFiles.get(id);
-      if (!fileHandle) {
-        // Referenced but physically missing (a foreign actor removed it,
-        // or `close()` did for a file it reported lost): surface it as an
-        // empty file rather than failing the whole store.
-        fileHandle = await this.store.getFileHandle(dataName(id), {
-          create: true,
-        });
-      }
-      dataFiles.delete(id);
-      this.handleById.set(id, await fileHandle.createSyncAccessHandle());
-    }
+    const referenced = [...this.physByNode.values()];
+    for (const id of referenced) dataFiles.delete(id);
+    await forEachConcurrently(referenced, async (id) => {
+      // A referenced file that is physically missing (a foreign actor
+      // removed it, or `close()` did for a file it reported lost) is
+      // recreated: it surfaces as an empty file rather than failing the
+      // whole store. Only a failed open closes the backend, once this has
+      // finished, so a handle always arrives.
+      this.handleById.set(id, (await this.openDataFile(id))!);
+    });
 
     // Reclaim tombstones: destroy any leftover content, reuse as spares.
-    for (const [id, fileHandle] of dataFiles) {
-      const handle = await fileHandle.createSyncAccessHandle();
+    // Only as many as the pool needs are opened; the rest are removed
+    // without ever taking their (lock-holding) handles.
+    const leftovers = [...dataFiles.keys()].sort((a, b) => a - b);
+    const reused = leftovers.slice(0, this.spareTarget);
+    await forEachConcurrently(reused, async (id) => {
+      const handle = await dataFiles.get(id)!.createSyncAccessHandle();
       this.handleById.set(id, handle);
       handle.truncate(0);
       handle.flush();
-      this.spares.push(id);
-    }
+    });
+    this.spares.push(...reused);
+    await forEachConcurrently(leftovers.slice(this.spareTarget), (id) =>
+      this.store.removeEntry(dataName(id)),
+    ).catch(() => {
+      // Best effort: the files are unreferenced, and the next open
+      // reclaims them again.
+    });
 
-    // Size the spare pool: pre-create what is missing, remove any excess.
-    while (this.spares.length < this.spareTarget) {
-      const id = this.nextId++;
-      const fileHandle = await this.store.getFileHandle(dataName(id), {
-        create: true,
-      });
-      this.handleById.set(id, await fileHandle.createSyncAccessHandle());
-      this.spares.push(id);
-    }
-    while (this.spares.length > this.spareTarget) {
-      const id = this.spares.pop()!;
-      this.handleById.get(id)!.close();
-      this.handleById.delete(id);
-      try {
-        await this.store.removeEntry(dataName(id));
-      } catch {
-        // Best effort: the file is unreferenced, and the next open
-        // reclaims it again.
-      }
-    }
+    // Pre-create whatever the pool still lacks.
+    await this.refillSpares();
 
-    // Persist the initial state (also records the advanced id counter).
-    this.snapshotFlush();
+    // Fold the replayed log into a fresh snapshot and start an empty log.
+    // A failed log reset leaves the backend correct but snapshotting on
+    // every change; see `compact`.
+    this.compact();
   }
 
   /**
-   * Rebuild the node tree from the namespace record. Children are created
-   * in record order - which `serializeDir` wrote in `entries` insertion
-   * order - so `listChildren` (and with it readdir cookie indexing) is
-   * stable across re-init.
+   * Decode the snapshot in slot `name`; `null` if it is empty or torn.
+   * Throws if the slot holds intact bytes in a format this version cannot
+   * read, such as the one earlier builds of this backend wrote, or one a
+   * later uwasi wrote. Opening anyway, from the other slot or as an empty
+   * store, would reclaim as unreferenced the data files of every file
+   * only that slot names, destroying their content.
    */
-  private graft(
-    dir: MetaDir,
-    base: string,
-    nodeById: Map<number, FileNode> = new Map(),
-  ): void {
-    for (const name of Object.keys(dir.d)) {
-      const child = dir.d[name];
-      const childPath = `${base}/${name}`;
-      if ("d" in child) {
-        this.fileSystem.ensureDir(childPath);
-        this.graft(child, childPath, nodeById);
-      } else if ("f" in child) {
-        let node = nodeById.get(child.f);
-        if (!node) {
-          node = this.fileSystem.createFile(childPath, new Uint8Array(0));
-          nodeById.set(child.f, node);
-          this.physByNode.set(node, child.f);
+  private readSlot(
+    name: string,
+    handle: OPFSSyncAccessHandle,
+  ): Snapshot | null {
+    try {
+      return decodeSnapshot(readAll(handle));
+    } catch (error) {
+      if (!(error instanceof UnknownFormatError)) throw error;
+      throw new Error(
+        `uwasi: ${name} holds a namespace snapshot this version does not understand (${error.message}); refusing to open the store rather than discard it`,
+      );
+    }
+  }
+
+  /**
+   * Apply one namespace record to the tree being rebuilt. Records come
+   * from a snapshot or, in order, from later changes, so each mirrors what
+   * the live `FSBackend` hook did to `entries` - including where a name
+   * lands in insertion order, which keeps `listChildren` (and with it
+   * readdir cookie indexing) stable across re-init. A record naming a
+   * parent or source that does not exist is skipped.
+   */
+  private applyRecord(record: NsRecord, replay: ReplayState): void {
+    switch (record.op) {
+      case Op.Mkdir: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        const existing = parent.entries[record.name];
+        let dir: DirectoryNode;
+        if (existing !== undefined && existing.type === "dir") {
+          // Preopens and /dev already exist in a fresh namespace.
+          dir = existing;
         } else {
-          // Two names for one id should not happen without hard links;
-          // keep them coherent by sharing the node if it ever does.
-          this.fileSystem.setNode(childPath, node);
+          this.forget(existing, replay);
+          // Null-prototype entries, as `makeDir` creates them.
+          dir = {
+            type: "dir",
+            entries: Object.create(null),
+          } as DirectoryNode;
+          this.fileSystem.setNodeIn(parent, record.name, dir);
         }
+        replay.dirs.set(record.dir, dir);
+        this.dirIds.set(dir, record.dir);
+        replay.maxDir = Math.max(replay.maxDir, record.dir);
+        return;
+      }
+      case Op.File: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        this.forget(parent.entries[record.name], replay);
+        const holder = replay.files.get(record.file);
+        if (holder) {
+          // Hard links are refused and a data file is reused only once no
+          // durable record names it, so a second live name for one id
+          // should never be logged. If one ever is, the id must have been
+          // reused: give the newer name the data file and leave the older
+          // one empty, rather than letting it show the other file's bytes.
+          this.physByNode.delete(holder);
+        }
+        const node = {
+          type: "file",
+          content: new Uint8Array(0),
+          nlink: 1,
+        } as FileNode;
+        replay.files.set(record.file, node);
+        this.physByNode.set(node, record.file);
+        this.fileSystem.setNodeIn(parent, record.name, node);
         this.known.add(node);
-      } else {
-        // `setNode` stamps inode metadata onto the bare node.
-        this.fileSystem.setNode(childPath, {
-          type: "symlink",
-          target: child.l,
-        } as SymlinkNode);
+        replay.maxFile = Math.max(replay.maxFile, record.file);
+        return;
+      }
+      case Op.Symlink: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        this.forget(parent.entries[record.name], replay);
+        const node = { type: "symlink", target: record.target } as SymlinkNode;
+        this.fileSystem.setNodeIn(parent, record.name, node);
+        this.known.add(node);
+        return;
+      }
+      case Op.Remove: {
+        const parent = replay.dirs.get(record.parent);
+        if (!parent) return;
+        const node = parent.entries[record.name];
+        if (node === undefined) return;
+        delete parent.entries[record.name];
+        this.forget(node, replay);
+        return;
+      }
+      case Op.Rename: {
+        const from = replay.dirs.get(record.fromParent);
+        const to = replay.dirs.get(record.toParent);
+        if (!from || !to) return;
+        const node = from.entries[record.fromName];
+        if (node === undefined) return;
+        const replaced = to.entries[record.toName];
+        delete from.entries[record.fromName];
+        to.entries[record.toName] = node;
+        if (replaced !== undefined && replaced !== node) {
+          this.forget(replaced, replay);
+        }
+        return;
       }
     }
+  }
+
+  /**
+   * A replayed record dropped `node`'s last name: release its data-file id
+   * so a later record may map the recycled id to a new file.
+   */
+  private forget(node: FSNode | undefined, replay: ReplayState): void {
+    if (node === undefined || node.type !== "file") return;
+    const id = this.physByNode.get(node);
+    if (id === undefined) return;
+    this.physByNode.delete(node);
+    this.known.delete(node);
+    if (replay.files.get(id) === node) replay.files.delete(id);
   }
 
   // -------------------------------------------------------------------
@@ -424,79 +604,215 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   /**
-   * Apply a namespace change to `dirs` with `apply` and record it. If the
-   * record fails, `dirs` get back exactly the entries they had, in their
-   * order too: insertion order is the listing order, which a reopen
-   * rebuilds from the record. Rethrows the failure.
+   * Apply one namespace change to the live tree with `apply`, which
+   * touches only `dirs`, and make it durable by appending its record to
+   * the log; `null` (a change no record can express, such as one under a
+   * directory or of a node that was never recorded) takes a full snapshot
+   * instead. Throws when the change could not be made durable (though the
+   * failed write may still have recorded it), with the change not applied:
+   * `dirs` keep exactly the entries they had, in their order too, since
+   * insertion order is the listing order a reopen rebuilds from the
+   * records.
    */
-  private recordChange(dirs: DirectoryNode[], apply: () => void): void {
-    const saved = dirs.map((dir) =>
-      Object.assign(Object.create(null), dir.entries),
+  private persist(
+    record: NsRecord | null,
+    dirs: DirectoryNode[],
+    apply: () => void,
+  ): void {
+    if (record === null || this.logStale) {
+      // A snapshot serializes the live tree, so the change goes in first.
+      const saved = dirs.map((dir) =>
+        Object.assign(Object.create(null), dir.entries),
+      );
+      apply();
+      try {
+        this.compact();
+      } catch (error) {
+        dirs.forEach((dir, i) => {
+          for (const name of Object.keys(dir.entries)) {
+            delete dir.entries[name];
+          }
+          Object.assign(dir.entries, saved[i]);
+        });
+        throw error;
+      }
+      return;
+    }
+    const frame = encodeFrame(
+      this.logWriter,
+      record,
+      this.generation,
+      this.logEnd,
     );
-    apply();
     try {
-      this.snapshotFlush();
+      writeFully(this.logHandle, frame, this.logEnd);
+      this.logHandle.flush();
     } catch (error) {
-      dirs.forEach((dir, i) => {
-        for (const name of Object.keys(dir.entries)) delete dir.entries[name];
-        Object.assign(dir.entries, saved[i]);
-      });
+      try {
+        // Leave no frame behind: a complete one would verify, so a later
+        // flush, or the storage itself, could still make the failed
+        // change durable.
+        this.logHandle.truncate(this.logEnd);
+      } catch {
+        // The next append overwrites it in place. Until then it may still
+        // become durable, so any data file the change freed stays out of
+        // the spare pool (see `quarantine`).
+      }
       throw error;
+    }
+    this.logEnd += frame.byteLength;
+    // Applied only once durable, so a failed append has nothing to undo.
+    apply();
+    if (
+      this.logEnd > this.compactAt.minBytes &&
+      this.logEnd > this.compactAt.ratio * this.snapshotBytes
+    ) {
+      try {
+        this.compact();
+      } catch {
+        // The change is durable in the log already; a failed compaction
+        // leaves the log in place and is retried on the next change.
+      }
     }
   }
 
   /**
-   * Serialize the live node tree into the older record slot and flush it.
-   * This is the single durability point for every namespace change. It
-   * also adopts any reachable file the backend has not persisted yet
-   * (files seeded through the `MemoryFileSystem` tree-builder), claiming
-   * spares - or overdraft ids - for them.
+   * Write a full snapshot, then reset the log to build on it. Throws only
+   * if the snapshot fails. The failed snapshot may still become durable
+   * (see `snapshotFlush`), and re-init would then ignore the log, so the
+   * log takes no more appends: later changes take full snapshots until one
+   * succeeds. If the reset fails after a good snapshot, the snapshot
+   * already covers every change: the stale log is ignored at re-init (its
+   * header names the older generation), and later changes take full
+   * snapshots until a compaction resets it.
+   */
+  private compact(): void {
+    this.logStale = true;
+    this.snapshotFlush();
+    try {
+      const header = encodeLogHeader(this.generation);
+      writeFully(this.logHandle, header, 0);
+      this.logHandle.truncate(header.byteLength);
+      this.logHandle.flush();
+      this.logEnd = header.byteLength;
+      this.logStale = false;
+    } catch {
+      // Stays stale; see above.
+    }
+  }
+
+  /**
+   * Serialize the live node tree into the slot not holding the current
+   * snapshot and flush it. It also adopts any reachable file the backend
+   * has not persisted yet (files seeded through the `MemoryFileSystem`
+   * tree-builder), claiming spares - or overdraft ids - for them.
+   *
+   * A failure after the write may leave a complete snapshot in the slot,
+   * and the storage may keep it however the call failed. It records the
+   * live tree as of this call, the failed change included, which a failed
+   * syscall allows. Re-init would load it and ignore the log, so the log
+   * takes no appends after it (see `compact`), and any data file the
+   * change freed stays out of the spare pool (see `quarantine`). Its
+   * generation is not used again in this session (see
+   * `attemptedGeneration`), and the retry goes to the same slot, so
+   * the current snapshot stays intact whatever the retry leaves behind,
+   * and a retry that succeeds replaces it.
    */
   private snapshotFlush(): void {
     const root = this.fileSystem.lookup("/") as DirectoryNode;
-    const files: FileNode[] = [];
-    const record = this.serializeDir(root, files);
-    const generation = this.generation + 1;
-    const buffer = encodeMeta({
-      gen: generation,
-      next: this.nextId,
-      root: record,
-    });
+    let generation = this.attemptedGeneration + 1;
+    if (generation % 2 === this.generation % 2) generation++;
+    this.attemptedGeneration = generation;
     const handle = this.metaHandles[generation % 2];
-    writeFully(handle, buffer, 0);
-    handle.truncate(buffer.byteLength);
-    handle.flush();
+    const out = this.encoder;
+    const assigned: DirectoryNode[] = [];
+    const named: (FileNode | SymlinkNode)[] = [];
+    // The directories the snapshot records: once it is durable, the only
+    // ones with an id (see `dirIds`).
+    const reached = new WeakMap([[root, ROOT_DIR_ID]]);
+    let buffer: Uint8Array;
+    try {
+      beginSnapshot(out, generation);
+      this.encodeDir(root, ROOT_DIR_ID, out, { assigned, named, reached });
+      buffer = finishSnapshot(out);
+      writeFully(handle, buffer, 0);
+      handle.truncate(buffer.byteLength);
+      handle.flush();
+    } catch (error) {
+      // A directory is recorded only once a durable record names it: log
+      // records under an id the snapshot never stored would be dropped.
+      for (const dir of assigned) this.dirIds.delete(dir);
+      try {
+        // The snapshot may include the change that failed. Empty the slot
+        // so that nothing publishes it later, such as storage persisting
+        // the slot when `close()` releases its handle; the current snapshot
+        // and log still hold everything. A crash before then may keep it
+        // (see above).
+        handle.truncate(0);
+      } catch {
+        // Then a later flush may publish it, with the same effect.
+      }
+      throw error;
+    }
     this.generation = generation;
-    for (const file of files) this.known.add(file);
+    this.snapshotBytes = buffer.byteLength;
+    this.dirIds = reached;
+    for (const node of named) this.known.add(node);
     this.spares.push(...this.quarantine.splice(0));
   }
 
-  /** Serialize `dir`'s subtree, collecting the file nodes it names. */
-  private serializeDir(dir: DirectoryNode, files: FileNode[]): MetaDir {
-    // Null prototype: a `__proto__` entry must stay an own property.
-    const d: { [name: string]: MetaEntry } = Object.create(null);
+  /**
+   * Emit the records that recreate `dir`'s subtree, in `entries` order,
+   * collecting the directories given new ids, every directory recorded
+   * with its id, and the file and symlink nodes named.
+   */
+  private encodeDir(
+    dir: DirectoryNode,
+    dirId: number,
+    out: ByteWriter,
+    seen: {
+      assigned: DirectoryNode[];
+      named: (FileNode | SymlinkNode)[];
+      reached: WeakMap<DirectoryNode, number>;
+    },
+  ): void {
     for (const name of Object.keys(dir.entries)) {
       const child = dir.entries[name];
       switch (child.type) {
-        case "dir":
-          d[name] = this.serializeDir(child, files);
+        case "dir": {
+          let id = this.dirIds.get(child);
+          if (id === undefined) {
+            id = this.nextDirId++;
+            this.dirIds.set(child, id);
+            seen.assigned.push(child);
+          }
+          seen.reached.set(child, id);
+          encodeRecord(out, { op: Op.Mkdir, parent: dirId, name, dir: id });
+          this.encodeDir(child, id, out, seen);
           break;
+        }
         case "file": {
           this.adopt(child);
-          files.push(child);
-          const id = this.physByNode.get(child) ?? this.pendingIds.get(child)!;
-          d[name] = { f: id };
+          seen.named.push(child);
+          const file =
+            this.physByNode.get(child) ?? this.pendingIds.get(child)!;
+          encodeRecord(out, { op: Op.File, parent: dirId, name, file });
           break;
         }
         case "symlink":
-          d[name] = { l: child.target };
+          seen.named.push(child);
+          encodeRecord(out, {
+            op: Op.Symlink,
+            parent: dirId,
+            name,
+            target: child.target,
+          });
           break;
         case "character":
           // Recreated by the MemoryFileSystem constructor on re-init.
           break;
       }
     }
-    return { d };
   }
 
   /**
@@ -514,16 +830,24 @@ export class OPFSBackend implements FSBackend {
       this.scheduleBackground();
       return;
     }
-    const handle = this.handleById.get(id)!;
-    try {
-      handle.truncate(0);
-      if (node.content.byteLength > 0) {
+    // Spares are durably empty - every path into the pool creates the
+    // file or truncates and flushes it - so an empty node needs no I/O.
+    if (node.content.byteLength > 0) {
+      const handle = this.handleById.get(id)!;
+      try {
         writeFully(handle, node.content, 0);
+        handle.flush();
+      } catch (error) {
+        try {
+          // Keep the invariant before handing the spare back.
+          handle.truncate(0);
+          handle.flush();
+          this.spares.unshift(id);
+        } catch {
+          // Leave it out of the pool; re-init reclaims the data file.
+        }
+        throw error;
       }
-      handle.flush();
-    } catch (error) {
-      this.spares.unshift(id);
-      throw error;
     }
     this.physByNode.set(node, id);
     node.content = new Uint8Array(0);
@@ -563,6 +887,14 @@ export class OPFSBackend implements FSBackend {
   private recycle(id: number, mayBeNamed: boolean): void {
     if (mayBeNamed) this.quarantine.push(id);
     else this.spares.push(id);
+  }
+
+  /** No record can name `id` any more: move it from quarantine to the pool. */
+  private release(id: number): void {
+    const at = this.quarantine.indexOf(id);
+    if (at === -1) return;
+    this.quarantine.splice(at, 1);
+    this.spares.push(id);
   }
 
   /**
@@ -620,7 +952,8 @@ export class OPFSBackend implements FSBackend {
       .then(async () => {
         this.replenishScheduled = false;
         // Materialize overdrafted files first: each waits on a durability
-        // guarantee (`sync` fails until its physical file exists). One
+        // guarantee (`sync` fails until its physical file exists). Files
+        // overdrafted meanwhile are picked up by the next batch. One
         // failure does not hold the others back.
         const failures: unknown[] = [];
         const tried = new Set<FileNode>();
@@ -629,24 +962,18 @@ export class OPFSBackend implements FSBackend {
             ([node]) => !tried.has(node),
           );
           if (batch.length === 0) break;
-          for (const [node, id] of batch) {
-            tried.add(node);
+          for (const [node] of batch) tried.add(node);
+          await forEachConcurrently(batch, async ([node, id]) => {
             try {
               await this.materialize(node, id);
             } catch (error) {
               failures.push(error);
             }
-          }
+          });
         }
         if (failures.length > 0) throw failures[0];
         // Then refill the spare pool.
-        while (this.spares.length < this.spareTarget && !this.closed) {
-          const id = this.nextId++;
-          const handle = await this.openDataFile(id);
-          if (handle === undefined) return;
-          this.handleById.set(id, handle);
-          this.spares.push(id);
-        }
+        if (!this.closed) await this.refillSpares();
       });
     // `settle()` and `close()` report a failure; nothing else awaits it.
     this.background.catch(() => {});
@@ -729,6 +1056,20 @@ export class OPFSBackend implements FSBackend {
     node.content = new Uint8Array(0);
   }
 
+  /** Create spare data files until the pool reaches its target. */
+  private async refillSpares(): Promise<void> {
+    const ids: number[] = [];
+    while (this.spares.length + ids.length < this.spareTarget) {
+      ids.push(this.nextId++);
+    }
+    await forEachConcurrently(ids, async (id) => {
+      const handle = await this.openDataFile(id);
+      if (handle === undefined) return;
+      this.handleById.set(id, handle);
+      this.spares.push(id);
+    });
+  }
+
   private errnoOf(error: unknown): number {
     if (error instanceof RangeError) return FSErrno.NOSPC;
     if ((error as { name?: string } | null)?.name === "QuotaExceededError") {
@@ -742,15 +1083,20 @@ export class OPFSBackend implements FSBackend {
   // -------------------------------------------------------------------
 
   /**
-   * Wait until background work is quiescent - no round scheduled or
-   * running, no file waiting for its data file - so files created past
-   * the spare pool have their data files, and the pool is refilled.
-   * Guest calls may run while it waits, and it waits for the work they
-   * queue too: no file reachable when it resolves still waits for its
-   * data file. A guest that keeps creating files past the pool during
-   * every wait can delay that indefinitely. Rejects as soon as a round
-   * fails; the files it left overdrafted keep their content in memory,
-   * and the next `settle()` (or file creation) retries.
+   * Wait until background work is quiescent - no round queued or
+   * running, no file waiting for its data file: files created past the
+   * spare pool get their data files (until then their content lives only
+   * in memory and `fd_sync` on them fails), and the pool is refilled to
+   * `spareFiles`. Background work runs only between guest calls, so a
+   * host that starts calls back to back should await this between them
+   * whenever created files should survive a crash, or before a call that
+   * creates many files. Guest calls may still run while it waits, and it
+   * waits for the work they queue too, so no file reachable when it
+   * resolves still waits for its data file; a guest that keeps creating
+   * files past the pool during every wait can delay that indefinitely.
+   * Rejects as soon as a round fails; the files it left keep their
+   * content in memory, and the next `settle()` (or file creation)
+   * retries.
    */
   async settle(): Promise<void> {
     // A fresh round retries what an earlier failed one left, rather than
@@ -782,7 +1128,7 @@ export class OPFSBackend implements FSBackend {
   async persistAll(): Promise<void> {
     const root = this.fileSystem.lookup("/") as DirectoryNode;
     await this.adoptSubtree(root);
-    this.snapshotFlush();
+    this.compact();
     // A guest call may overdraft another file once `settle()` has resolved
     // but before this resumes: settle again until none is pending. No
     // await separates that check from the flush, so no guest call can
@@ -796,49 +1142,54 @@ export class OPFSBackend implements FSBackend {
     if (failure !== undefined) throw failure;
   }
 
-  private async adoptSubtree(dir: DirectoryNode): Promise<void> {
-    for (const name of Object.keys(dir.entries)) {
-      // The guest runs while this awaits, so an entry may be gone.
-      const child = dir.entries[name] as FSNode | undefined;
-      if (child === undefined) continue;
-      if (child.type === "dir") {
-        await this.adoptSubtree(child);
-      } else if (
-        child.type === "file" &&
-        !this.physByNode.has(child) &&
-        // Overdrafted files already have an id; settle() materializes them.
-        !this.pendingIds.has(child)
-      ) {
-        const id = this.nextId++;
-        const handle = await this.openDataFile(id);
-        if (handle === undefined) return;
-        this.handleById.set(id, handle);
-        if (
-          this.physByNode.has(child) ||
-          this.pendingIds.has(child) ||
-          child.nlink === 0
+  private async adoptSubtree(root: DirectoryNode): Promise<void> {
+    const unadopted: FileNode[] = [];
+    const walk = (dir: DirectoryNode): void => {
+      for (const name of Object.keys(dir.entries)) {
+        const child = dir.entries[name];
+        if (child.type === "dir") {
+          walk(child);
+        } else if (
+          child.type === "file" &&
+          !this.physByNode.has(child) &&
+          // Overdrafted files already have an id; settle() materializes them.
+          !this.pendingIds.has(child)
         ) {
-          // Adopted while the handle was on its way, by a guest open or a
-          // snapshot, and maybe written and synced since; or unlinked (or
-          // replaced by a rename), so no name needs its bytes. The new
-          // data file is empty and no record names it: keep it as a spare.
-          this.spares.push(id);
-          continue;
+          unadopted.push(child);
         }
-        try {
-          if (child.content.byteLength > 0) {
-            writeFully(handle, child.content, 0);
-          }
-          handle.flush();
-        } catch (error) {
-          // No record names the new data file: empty it for the pool.
-          this.recycleAbandoned(id, false);
-          throw error;
-        }
-        this.physByNode.set(child, id);
-        child.content = new Uint8Array(0);
       }
-    }
+    };
+    walk(root);
+    await forEachConcurrently(unadopted, async (child) => {
+      const id = this.nextId++;
+      const handle = await this.openDataFile(id);
+      if (handle === undefined) return;
+      this.handleById.set(id, handle);
+      if (
+        this.physByNode.has(child) ||
+        this.pendingIds.has(child) ||
+        child.nlink === 0
+      ) {
+        // Adopted while the handle was on its way, by a guest open or a
+        // snapshot, and maybe written and synced since; or unlinked (or
+        // replaced by a rename), so no name needs its bytes. The new data
+        // file is empty and no record names it: keep it as a spare.
+        this.spares.push(id);
+        return;
+      }
+      try {
+        if (child.content.byteLength > 0) {
+          writeFully(handle, child.content, 0);
+        }
+        handle.flush();
+      } catch (error) {
+        // No record names the new data file: empty it for the pool.
+        this.recycleAbandoned(id, false);
+        throw error;
+      }
+      this.physByNode.set(child, id);
+      child.content = new Uint8Array(0);
+    });
   }
 
   /**
@@ -869,7 +1220,23 @@ export class OPFSBackend implements FSBackend {
     );
     this.closed = true;
     await this.background.catch(() => {});
-    // A guest call during that wait may have overdrafted a file that no
+    // Leave the pool at its target, so the next `create()` does not have
+    // to open and remove data files freed by this session's unlinks.
+    const excess = this.spares.splice(this.spareTarget);
+    for (const id of excess) {
+      try {
+        this.handleById.get(id)!.close();
+      } catch {
+        // Already closed or revoked; the removal below may still work.
+      }
+      this.handleById.delete(id);
+    }
+    await forEachConcurrently(excess, (id) =>
+      this.store.removeEntry(dataName(id)),
+    ).catch(() => {
+      // Best effort: re-init reclaims whatever is left.
+    });
+    // A guest call during those waits may have overdrafted a file that no
     // round can give a data file any more.
     for (const node of this.pendingIds.keys()) lost.add(node);
     // Closing a sync access handle only releases it: the File System
@@ -900,9 +1267,10 @@ export class OPFSBackend implements FSBackend {
 
   /**
    * Flush the data file of every file the guest may still reach; unlinked
-   * files awaiting their last close are skipped. The namespace slots are
-   * not flushed: every successful change flushed its record already, and
-   * a failed one may have left bytes there that a flush would publish.
+   * files awaiting their last close are skipped. The namespace slots and
+   * the log are not flushed: every successful change flushed its record
+   * already, and a failed one may have left bytes there that a flush would
+   * publish.
    * Every file is tried; returns the first failure.
    */
   private flushDataFiles(): unknown {
@@ -919,7 +1287,10 @@ export class OPFSBackend implements FSBackend {
   }
 
   private releaseHandles(): void {
-    for (const handle of [...this.handleById.values(), ...this.metaHandles]) {
+    const handles = [...this.handleById.values(), ...this.metaHandles];
+    // Unset when opening failed before it reached the log.
+    if (this.logHandle !== undefined) handles.push(this.logHandle);
+    for (const handle of handles) {
       try {
         handle.close();
       } catch {
@@ -962,6 +1333,8 @@ export class OPFSBackend implements FSBackend {
   }
 
   writeAt(node: FileNode, data: Uint8Array, offset: number): number {
+    // Writing nothing changes nothing, not even the size past EOF.
+    if (data.byteLength === 0) return FSErrno.SUCCESS;
     const id = this.physByNode.get(node);
     if (id === undefined) {
       // Not yet persisted (tree-builder seeded): plain in-memory write;
@@ -1030,8 +1403,8 @@ export class OPFSBackend implements FSBackend {
         this.handleById.get(id)!.flush();
       }
       // A directory needs nothing: every namespace change flushed its
-      // record before its syscall returned. Flushing the slots again could
-      // only make durable a snapshot that a failed change left behind.
+      // record before its syscall returned. Flushing the slots or the log
+      // again could only make durable what a failed change left behind.
     } catch (error) {
       return this.errnoOf(error);
     }
@@ -1053,13 +1426,13 @@ export class OPFSBackend implements FSBackend {
     ) {
       // First open of a file the record does not name yet: adopt it now
       // so every later op runs over its sync access handle, and record it
-      // (path_open with CREAT already snapshotted, this covers
-      // tree-builder seeded files opened before any namespace change, and
-      // retries after that snapshot failed). A recorded file needs no new
-      // record, even overdrafted: its id is already in it.
+      // (path_open with CREAT already logged it, this covers tree-builder
+      // seeded files, and retries after recording them failed). A
+      // recorded file needs no new record, even overdrafted: its id is
+      // already in it.
       try {
         this.adopt(node);
-        this.snapshotFlush();
+        this.compact();
       } catch (error) {
         return this.errnoOf(error);
       }
@@ -1106,19 +1479,68 @@ export class OPFSBackend implements FSBackend {
       return FSErrno.NOTSUP;
     }
     try {
-      this.recordChange([parent], () => {
+      this.persist(this.createRecord(parent, name, node), [parent], () => {
         parent.entries[name] = node;
       });
     } catch (error) {
       if (node.type === "file") {
         // Hand back the data file (or overdraft id) the record would have
-        // named. The failed snapshot may still name it, so it waits in
-        // quarantine rather than backing the next file at once.
+        // named. The failed record - a snapshot left in its slot, or a log
+        // record past the end of the log - may still become durable, so
+        // the data file waits in quarantine rather than backing the next
+        // file at once.
         this.tombstone(node, true);
       }
       return this.errnoOf(error);
     }
+    if (node.type === "file" || node.type === "symlink") this.known.add(node);
     return FSErrno.SUCCESS;
+  }
+
+  /**
+   * Whether a durable record names `node`, so that a log record referring
+   * to it replays. Replay skips a record whose node it does not find, so a
+   * change touching an unrecorded node (one seeded through the tree-builder,
+   * or one whose recording failed) takes a full snapshot instead.
+   */
+  private recorded(node: FSNode): boolean {
+    switch (node.type) {
+      case "dir":
+        return this.dirIds.has(node);
+      case "file":
+      case "symlink":
+        return this.known.has(node);
+      default:
+        // No record names a device node; changes naming one are refused
+        // before they get here (see `involvesDevice`).
+        return false;
+    }
+  }
+
+  private createRecord(
+    parent: DirectoryNode,
+    name: string,
+    node: FSNode,
+  ): NsRecord | null {
+    const dirId = this.dirIds.get(parent);
+    if (dirId === undefined) return null;
+    switch (node.type) {
+      case "dir": {
+        if (Object.keys(node.entries).length > 0) return null;
+        const id = this.nextDirId++;
+        this.dirIds.set(node, id);
+        return { op: Op.Mkdir, parent: dirId, name, dir: id };
+      }
+      case "file": {
+        this.adopt(node);
+        const file = this.physByNode.get(node) ?? this.pendingIds.get(node)!;
+        return { op: Op.File, parent: dirId, name, file };
+      }
+      case "symlink":
+        return { op: Op.Symlink, parent: dirId, name, target: node.target };
+      default:
+        return null;
+    }
   }
 
   removeChild(parent: DirectoryNode, name: string): number {
@@ -1129,6 +1551,11 @@ export class OPFSBackend implements FSBackend {
     // id is released once the removal is durable.
     const pending =
       node !== undefined && node.type === "file" && this.pendingIds.has(node);
+    // The data file a durable record maps the name to, if any.
+    const named =
+      node !== undefined && node.type === "file" && this.known.has(node)
+        ? this.physByNode.get(node)
+        : undefined;
     if (node !== undefined && node.type === "file" && !pending) {
       // Step 1: destroy the content durably, or defer that to the last
       // close while fds are open, before the unlink itself becomes
@@ -1137,11 +1564,16 @@ export class OPFSBackend implements FSBackend {
       const errno = this.tombstone(node, true);
       if (errno !== FSErrno.SUCCESS) return errno;
     }
+    const dirId = this.dirIds.get(parent);
     try {
       // Step 2: record the namespace without the entry.
-      this.recordChange([parent], () => {
-        delete parent.entries[name];
-      });
+      this.persist(
+        dirId === undefined ? null : { op: Op.Remove, parent: dirId, name },
+        [parent],
+        () => {
+          delete parent.entries[name];
+        },
+      );
     } catch (error) {
       // The name keeps resolving. The content may already be gone,
       // leaving the name mapped to an empty file - the documented crash
@@ -1153,6 +1585,10 @@ export class OPFSBackend implements FSBackend {
       return this.errnoOf(error);
     }
     if (pending) this.tombstone(node as FileNode, false);
+    // A durable removal record drops the name, and replay forgets its data
+    // file there, before any later record can name it again. A snapshot
+    // already released the quarantine; a log record releases this file.
+    if (named !== undefined) this.release(named);
     return FSErrno.SUCCESS;
   }
 
@@ -1167,11 +1603,25 @@ export class OPFSBackend implements FSBackend {
     if (involvesDevice(node) || involvesDevice(replaced)) {
       return FSErrno.NOTSUP;
     }
+    const fromId = this.dirIds.get(fromParent);
+    const toId = this.dirIds.get(toParent);
     try {
       // Record the new mapping first, so that a crash here shows either
       // the old target or the renamed node at the destination, never a
       // truncated file in between.
-      this.recordChange(
+      this.persist(
+        fromId === undefined ||
+          toId === undefined ||
+          !this.recorded(node) ||
+          (replaced !== undefined && !this.recorded(replaced))
+          ? null
+          : {
+              op: Op.Rename,
+              fromParent: fromId,
+              fromName,
+              toParent: toId,
+              toName,
+            },
         fromParent === toParent ? [fromParent] : [fromParent, toParent],
         () => {
           delete fromParent.entries[fromName];

@@ -266,6 +266,32 @@ describe("hard links to a symlink", () => {
   });
 });
 
+describe("empty writes", () => {
+  it("an empty iovec past EOF does not grow a file", async () => {
+    const { bindImports, sysCreate, sysStat, sysWrite } = await import(
+      "./syscall_harness.mjs"
+    );
+    const h = bindImports(
+      new MemoryFSBackend(),
+      new MemoryFileSystem({ "/": "/" }),
+    );
+    // fd_write with one empty iovec at a cursor past the end.
+    const file = sysCreate(h, "empty");
+    assert.strictEqual(h.imports.fd_seek(file.fd, 100n, 0, 5000), ESUCCESS);
+    assert.strictEqual(sysWrite(h, file.fd, "").errno, ESUCCESS);
+    assert.strictEqual(sysStat(h, "empty").size, 0);
+    // fd_pwrite with one empty iovec far past the end.
+    assert.strictEqual(sysWrite(h, file.fd, "abc").errno, ESUCCESS);
+    h.view.setUint32(256, 512, true);
+    h.view.setUint32(260, 0, true);
+    assert.strictEqual(
+      h.imports.fd_pwrite(file.fd, 256, 1, 1000n, 4096),
+      ESUCCESS,
+    );
+    assert.strictEqual(sysStat(h, "empty").size, 103);
+  });
+});
+
 describe("path_rename of a directory", () => {
   it("refuses to move it into its own subtree", async () => {
     const { bindImports, sysMkdir, sysRename, sysStat } = await import(

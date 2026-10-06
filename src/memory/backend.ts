@@ -56,6 +56,8 @@ export class MemoryFSBackend implements FSBackend {
     return count;
   }
   writeAt(node: FileNode, data: Uint8Array, offset: number): number {
+    // Writing nothing changes nothing, not even the size past EOF.
+    if (data.byteLength === 0) return WASIAbi.WASI_ESUCCESS;
     const end = offset + data.byteLength;
     if (end > node.content.byteLength) {
       const errno = resizeFile(node, end);

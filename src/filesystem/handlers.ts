@@ -414,9 +414,14 @@ export function bindFSSyscalls(
       // current cursor, and never moves the cursor.
       let position = Number(offset);
       const total = iovViews.reduce((acc, b) => acc + b.byteLength, 0);
-      if (position + total > backend.fileSize(file.node)) {
-        const errno = backend.resize(file.node, position + total);
-        if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
+      // `writeAt` extends the file itself; only reject an end offset that
+      // no JS number can represent before writing anything. A pre-write
+      // resize would cost backends with real files an extra truncate. The
+      // iovecs are written in turn, so when a later one fails, the earlier
+      // ones stay written (the file grown to hold them) while the call
+      // reports only the errno.
+      if (position + total > Number.MAX_SAFE_INTEGER) {
+        return WASIAbi.WASI_ERRNO_FBIG;
       }
       for (const buf of iovViews) {
         const errno = backend.writeAt(file.node, buf, position);
@@ -592,9 +597,14 @@ export function bindFSSyscalls(
           ? backend.fileSize(file.node)
           : file.position;
       const total = iovViews.reduce((acc, b) => acc + b.byteLength, 0);
-      if (position + total > backend.fileSize(file.node)) {
-        const errno = backend.resize(file.node, position + total);
-        if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
+      // `writeAt` extends the file itself; only reject an end offset that
+      // no JS number can represent before writing anything. A pre-write
+      // resize would cost backends with real files an extra truncate. The
+      // iovecs are written in turn, so when a later one fails, the earlier
+      // ones stay written (the file grown to hold them) while the call
+      // reports only the errno.
+      if (position + total > Number.MAX_SAFE_INTEGER) {
+        return WASIAbi.WASI_ERRNO_FBIG;
       }
       for (const buf of iovViews) {
         const errno = backend.writeAt(file.node, buf, position);
