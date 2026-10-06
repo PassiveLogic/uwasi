@@ -24,15 +24,20 @@ and change their OPFS import specifier, not just move source files.
 ## Public Contract
 
 `uwasi/filesystem` exports `FSBackend`, `FileNode`, `DirectoryNode`, `SymlinkNode`,
-`FSNode`, `MemoryFileSystem`, `StdioOptions`, `FSErrno`, `FSError`, and `useFileSystem`.
+`FSNode`, `MemoryFileSystem`, `StdioOptions`, `FSErrno`, `FSError`, and `useFS`.
+
+`useFS` is also exported from `uwasi`, as the same function. It replaces both the
+empty root `useFS({ fs })` placeholder and the generic `useFileSystem` export.
+`useFileSystem` has been removed without a compatibility alias; rename those
+calls to `useFS`, keeping the same typed options shown below.
 
 ```ts
 import { WASI } from "uwasi";
-import { useFileSystem } from "uwasi/filesystem";
+import { useFS } from "uwasi/filesystem";
 
 const wasi = new WASI({
   features: [
-    useFileSystem({
+    useFS({
       withBackend: backend,
       withFileSystem: namespace,
       withStdio: { stdout: console.log },
@@ -46,6 +51,9 @@ The historical class name is retained: it supplies the live node tree and
 preopens even when file bytes live elsewhere. The provider uses that namespace's
 preopens, not `WASIOptions.preopens`. Complete asynchronous setup before binding.
 The provider handles ABI and guest-memory wiring; backends do not import either.
+Both `useMemoryFS` and `useOPFS` delegate to `useFS` and retain `withStdio`,
+including `extraFds`. When no namespace is supplied, `useMemoryFS` creates one
+using `WASIOptions.preopens`; `useOPFS` uses its backend's existing namespace.
 
 All backend operations remain synchronous and receive the actual node objects.
 The handlers resolve paths and read directory entries directly, so backend
@@ -103,11 +111,8 @@ without an import map. A future extraction can move `src/opfs/` and replace that
 single boundary specifier with `uwasi/filesystem`; no syscall internals need move.
 No such package is created or published by this refactor.
 
-Tests use package-name imports (`uwasi`, `uwasi/filesystem`, `uwasi/opfs`) when
-checking the public surface. Relative `../lib/esm/...` and `../lib/cjs/...`
-imports in the compatibility test deliberately check those exact old build
-paths. No `@uwasi/...` alias is configured. TypeScript `paths` alone would not
-make such an alias resolvable by Node or a browser.
+Tests use package-name imports (`uwasi`, `uwasi/filesystem`, `uwasi/opfs`) for
+the public surface. No `@uwasi/...` alias is configured.
 
 ## Unchanged Limits
 
@@ -138,26 +143,10 @@ Shutdown hardening removes a pending mapping when its materialization is
 cancelled by close, without dropping a newer mapping. This does not make guest
 operations during or after backend close supported.
 
-`test/filesystem-boundary.test.mjs` packs and unpacks the built package in a
-temporary directory, tests ESM/CJS imports, and compiles an external backend using
-legacy TypeScript Node resolution with no source aliases. It also copies the real
-OPFS subtree unchanged and supplies a one-line public-package re-export at the
-boundary, then compiles and exercises that copy against the packaged declarations.
-Its persistence round trip uses the existing OPFS mock, not a browser. These tests
-do not establish real-browser durability or change the existing storage guarantees.
-
-The tests also traverse the emitted ESM static dependency graph and inspect a
-fresh CommonJS process's `require.cache` to exclude OPFS from root imports.
-After verifying the full packed installation supports OPFS, the fixture removes
-only its installed OPFS modules and compatibility exports. Fresh ESM and CommonJS
-processes still construct `WASI` with `useAll()` and exercise a filesystem syscall;
-explicit `uwasi/opfs` imports fail as a control. Repository files are not removed.
-
-The boundary fixture's named memory addresses are non-overlapping offsets chosen
-for its guest buffer, not WASI constants. Its iovec contains a 32-bit buffer
-pointer followed by a 32-bit length. The preopen descriptor, create flag, seek
-origin and rights mask follow the WASI Preview 1 ABI. Payload values are test
-data; `UNCHANGED_OUTPUT` detects accidental result writes on a failed operation.
+`test/fs_backend.test.mjs` and `test/opfs_backend.test.mjs` share a small backend
+contract suite. They cover provider wiring, basic error handling, persistence,
+sync, and namespace changes. Both backends also run the WASI conformance suite.
+OPFS tests use an in-memory mock; they do not establish real-browser durability.
 
 ## Sizing the OPFS Spare Pool
 

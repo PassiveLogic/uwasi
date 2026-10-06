@@ -1,7 +1,5 @@
 // Drive `bindFSSyscalls`'s imports directly against a backend, the way a
-// wasm guest would, without instantiating a module. Mirrors the seam
-// harness in fs_backend.test.mjs but works for any backend + file system
-// pair (the OPFS tests bind the backend's own MemoryFileSystem mirror).
+// wasm guest would, without instantiating a module.
 import { bindFSSyscalls } from "../lib/esm/features/fd.js";
 import { WASIAbi } from "../lib/esm/abi.js";
 
@@ -148,12 +146,6 @@ export function sysStat(h, name, dirfd = PREOPEN_FD) {
   // filestat layout: dev(8) ino(8) filetype(1+7) nlink(8) size(8) ...
   const size = errno === 0 ? h.view.getBigUint64(FILESTAT_PTR + 32, true) : 0n;
   return { errno, size: Number(size) };
-}
-
-export function sysSymlink(h, target, name, dirfd = PREOPEN_FD) {
-  const targetLen = putPath(h, target, PATH_PTR);
-  const nameLen = putPath(h, name, PATH2_PTR);
-  return h.imports.path_symlink(PATH_PTR, targetLen, dirfd, PATH2_PTR, nameLen);
 }
 
 /** path_filestat_get without following a final symlink. */

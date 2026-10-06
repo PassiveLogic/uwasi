@@ -60,7 +60,7 @@ export function fnv1a(bytes: Uint8Array, hash = 0x811c9dc5): number {
 }
 
 const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder();
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** A growable byte buffer for encoding. */
 export class ByteWriter {

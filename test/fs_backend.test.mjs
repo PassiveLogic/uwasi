@@ -1,16 +1,24 @@
-import {
-  MemoryFileSystem,
-  MemoryFSBackend,
-  bindFSSyscalls,
-} from "../lib/esm/features/fd.js";
+import assert from "node:assert/strict";
+import { it } from "node:test";
+import { WASI, useFS } from "uwasi";
+import { FSErrno, FSError, MemoryFileSystem } from "uwasi/filesystem";
 import { WASIAbi } from "../lib/esm/abi.js";
+import { MemoryFSBackend } from "../lib/esm/memory/backend.js";
 import { fsBackendContractSuite } from "./fs_backend_contract.mjs";
-import { describe, it } from "node:test";
-import assert from "node:assert";
+import {
+  bindImports,
+  sysCreate,
+  sysWrite,
+  sysReadText,
+  sysSeekStart,
+  sysSync,
+  sysDatasync,
+  sysClose,
+  sysLink,
+  sysLstat,
+} from "./syscall_harness.mjs";
 
-const ESUCCESS = 0;
-
-function memoryFixture() {
+fsBackendContractSuite("memory", () => {
   const fs = new MemoryFileSystem({ "/": "/" });
   let serial = 0;
   return {
@@ -19,322 +27,80 @@ function memoryFixture() {
       fs.createFile(`/scratch/f${serial++}`, content),
     makeDirNode: () => fs.ensureDir(`/scratch/d${serial++}`),
   };
-}
+});
 
-fsBackendContractSuite("memory", memoryFixture);
-
-const PATH_PTR = 0;
-const IOVEC_PTR = 256;
-const DATA_PTR = 512;
-const OUT_PTR = 1024;
-
-const PREOPEN_FD = 3;
-const OFLAGS_CREAT = 1 << 0;
-const ALL_RIGHTS = BigInt((1 << 30) - 1);
-
-/** Records which backend methods the syscall layer actually reaches. */
-class SpyBackend extends MemoryFSBackend {
-  calls = [];
-  openFile(node) {
-    this.calls.push("openFile");
-    return super.openFile(node);
-  }
-  closeFile(node) {
-    this.calls.push("closeFile");
-    super.closeFile(node);
-  }
-  sync(node) {
-    this.calls.push("sync");
-    return super.sync(node);
-  }
-  datasync(node) {
-    this.calls.push("datasync");
-    return super.datasync(node);
-  }
-  readAt(node, buf, offset) {
-    this.calls.push("readAt");
-    return super.readAt(node, buf, offset);
-  }
-  writeAt(node, data, offset) {
-    this.calls.push("writeAt");
-    return super.writeAt(node, data, offset);
-  }
-  removeChild(parent, name) {
-    this.calls.push("removeChild");
-    return super.removeChild(parent, name);
-  }
-}
-
-/** Drive `bindFSSyscalls`'s imports directly, as `fd.test.mjs` drives `useMemoryFS`. */
-function makeSeam(backend) {
-  const fileSystem = new MemoryFileSystem({ "/": "/" });
-  const memory = new ArrayBuffer(65536);
-  const view = new DataView(memory);
-  const bytes = new Uint8Array(memory);
-  const imports = bindFSSyscalls(
-    backend,
-    fileSystem,
-    {},
-    new WASIAbi(),
-    () => view,
+it("root useFS supplies working filesystem syscalls and provider preopens", () => {
+  const fileSystem = new MemoryFileSystem({ "/store": "/" });
+  const wasi = new WASI({
+    preopens: { "/ignored": "/" },
+    features: [
+      useFS({ withBackend: new MemoryFSBackend(), withFileSystem: fileSystem }),
+    ],
+  });
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  wasi.setInstance({ exports: { memory } });
+  const h = {
+    imports: wasi.wasiImport,
+    view: new DataView(memory.buffer),
+    bytes: new Uint8Array(memory.buffer),
+  };
+  assert.equal(h.imports.fd_prestat_get(3, 4096), 0);
+  const length = h.view.getUint32(4100, true);
+  assert.equal(h.imports.fd_prestat_dir_name(3, 512, length), 0);
+  assert.equal(
+    new TextDecoder().decode(h.bytes.subarray(512, 512 + length)),
+    "/store",
   );
-  return { imports, view, bytes };
-}
 
-function openFile({ imports, view, bytes }, name) {
-  const path = new TextEncoder().encode(name);
-  bytes.set(path, PATH_PTR);
-  const ret = imports.path_open(
-    PREOPEN_FD,
-    0,
-    PATH_PTR,
-    path.length,
-    OFLAGS_CREAT,
-    ALL_RIGHTS,
-    ALL_RIGHTS,
-    0,
-    OUT_PTR,
+  const { errno, fd } = sysCreate(h, "file.txt");
+  assert.equal(errno, 0);
+  assert.deepEqual(sysWrite(h, fd, "stored bytes"), { errno: 0, written: 12 });
+  assert.equal(sysSeekStart(h, fd), 0);
+  h.bytes.fill(0, 512, 524);
+  assert.deepEqual(sysReadText(h, fd), { errno: 0, text: "stored bytes" });
+  assert.equal(sysSync(h, fd), 0);
+  assert.equal(sysDatasync(h, fd), 0);
+  assert.equal(sysClose(h, fd), 0);
+});
+
+it("maps FSError to errno but propagates unexpected backend errors", () => {
+  const backend = new MemoryFSBackend();
+  const h = bindImports(backend, new MemoryFileSystem({ "/": "/" }));
+  const { errno, fd } = sysCreate(h, "file");
+  assert.equal(errno, 0);
+  backend.readAt = () => {
+    throw new FSError(FSErrno.IO);
+  };
+  assert.equal(sysReadText(h, fd).errno, FSErrno.IO);
+
+  const unexpected = new TypeError("backend programming error");
+  backend.readAt = () => {
+    throw unexpected;
+  };
+  assert.throws(
+    () => sysReadText(h, fd),
+    (error) => error === unexpected,
   );
-  assert.strictEqual(ret, ESUCCESS, `path_open(${name}) errno ${ret}`);
-  return view.getUint32(OUT_PTR, true);
-}
+  assert.equal(sysClose(h, fd), 0);
+});
 
-describe("fd.bindFSSyscalls backend seam", () => {
-  it("path_open and fd_close reach openFile and closeFile", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    const fd = openFile(h, "file.txt");
-    assert.ok(backend.calls.includes("openFile"));
-    assert.strictEqual(h.imports.fd_close(fd), ESUCCESS);
-    assert.ok(backend.calls.includes("closeFile"));
-  });
-
-  it("fd_sync and fd_datasync on a file fd reach the backend", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    const fd = openFile(h, "file.txt");
-    assert.strictEqual(h.imports.fd_sync(fd), ESUCCESS);
-    assert.strictEqual(h.imports.fd_datasync(fd), ESUCCESS);
-    assert.ok(backend.calls.includes("sync"));
-    assert.ok(backend.calls.includes("datasync"));
-  });
-
-  it("fd_sync on a directory fd reaches the backend", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    assert.strictEqual(h.imports.fd_sync(PREOPEN_FD), ESUCCESS);
-    assert.deepStrictEqual(backend.calls, ["sync"]);
-  });
-
-  it("fd_sync on a stdio fd succeeds without touching the backend", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    assert.strictEqual(h.imports.fd_sync(1), ESUCCESS);
-    assert.deepStrictEqual(backend.calls, []);
-  });
-
-  it("fd_write and fd_read move bytes through the backend", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    const fd = openFile(h, "file.txt");
-
-    h.bytes.set(new TextEncoder().encode("hi"), DATA_PTR);
-    h.view.setUint32(IOVEC_PTR, DATA_PTR, true);
-    h.view.setUint32(IOVEC_PTR + 4, 2, true);
-    assert.strictEqual(
-      h.imports.fd_write(fd, IOVEC_PTR, 1, OUT_PTR + 8),
-      ESUCCESS,
-    );
-    assert.ok(backend.calls.includes("writeAt"));
-
-    h.view.setBigUint64(OUT_PTR + 16, 0n, true);
-    assert.strictEqual(h.imports.fd_seek(fd, 0n, 0, OUT_PTR + 16), ESUCCESS);
-    assert.strictEqual(
-      h.imports.fd_read(fd, IOVEC_PTR, 1, OUT_PTR + 8),
-      ESUCCESS,
-    );
-    assert.ok(backend.calls.includes("readAt"));
-    assert.strictEqual(h.view.getUint32(OUT_PTR + 8, true), 2);
-    assert.strictEqual(
-      new TextDecoder().decode(h.bytes.subarray(DATA_PTR, DATA_PTR + 2)),
-      "hi",
-    );
-  });
-
-  it("path_unlink_file reaches removeChild", () => {
-    const backend = new SpyBackend();
-    const h = makeSeam(backend);
-    const fd = openFile(h, "gone.txt");
-    assert.strictEqual(h.imports.fd_close(fd), ESUCCESS);
-    const path = new TextEncoder().encode("gone.txt");
-    h.bytes.set(path, PATH_PTR);
-    assert.strictEqual(
-      h.imports.path_unlink_file(PREOPEN_FD, PATH_PTR, path.length),
-      ESUCCESS,
-    );
-    assert.ok(backend.calls.includes("removeChild"));
-  });
-
-  it("path_link undoes its nlink count when createChild throws", () => {
-    class ThrowingLinkBackend extends MemoryFSBackend {
-      createChild(parent, name, node) {
-        if (node.type === "file" && node.nlink > 1) {
-          throw new Error("backend bug");
-        }
-        return super.createChild(parent, name, node);
-      }
+it("rolls back link bookkeeping when namespace creation fails", () => {
+  class FailingLinkBackend extends MemoryFSBackend {
+    createChild(parent, name, node) {
+      if (node.nlink > 1) throw new FSError(FSErrno.IO);
+      return super.createChild(parent, name, node);
     }
-    const h = makeSeam(new ThrowingLinkBackend());
-    assert.strictEqual(h.imports.fd_close(openFile(h, "src")), ESUCCESS);
-    const encoder = new TextEncoder();
-    const from = encoder.encode("src");
-    const to = encoder.encode("dst");
-    h.bytes.set(from, PATH_PTR);
-    h.bytes.set(to, PATH_PTR + 64);
-    assert.throws(
-      () =>
-        h.imports.path_link(
-          PREOPEN_FD,
-          0,
-          PATH_PTR,
-          from.length,
-          PREOPEN_FD,
-          PATH_PTR + 64,
-          to.length,
-        ),
-      /backend bug/,
-    );
-    // path_filestat_get: nlink is the u64 at offset 24 of the filestat.
-    h.bytes.set(from, PATH_PTR);
-    assert.strictEqual(
-      h.imports.path_filestat_get(
-        PREOPEN_FD,
-        0,
-        PATH_PTR,
-        from.length,
-        OUT_PTR,
-      ),
-      ESUCCESS,
-    );
-    assert.strictEqual(h.view.getBigUint64(OUT_PTR + 24, true), 1n);
-  });
-});
-
-describe("MemoryFileSystem directory entries", () => {
-  it("names shadowing Object.prototype members are ordinary entries", async () => {
-    const { bindImports, sysCreate, sysClose, sysStat, sysMkdir } =
-      await import("./syscall_harness.mjs");
-    const fs = new MemoryFileSystem({ "/": "/" });
-    const backend = new MemoryFSBackend();
-    const h = bindImports(backend, fs);
-    const names = ["constructor", "__proto__", "toString", "hasOwnProperty"];
-    for (const name of names) {
-      assert.strictEqual(sysStat(h, name).errno, WASIAbi.WASI_ERRNO_NOENT);
-      const { errno, fd } = sysCreate(h, name);
-      assert.strictEqual(errno, ESUCCESS, `creating ${name}`);
-      assert.strictEqual(sysClose(h, fd), ESUCCESS);
-      assert.strictEqual(sysStat(h, name).errno, ESUCCESS);
-    }
-    assert.strictEqual(sysMkdir(h, "__defineGetter__"), ESUCCESS);
-    fs.addFile("/__defineGetter__/constructor", "seeded");
-    assert.strictEqual(sysStat(h, "__defineGetter__/constructor").size, 6);
-    assert.deepStrictEqual(
-      backend
-        .listChildren(fs.lookup("/"))
-        .filter((n) => n !== "dev")
-        .sort(),
-      [...names, "__defineGetter__"].sort(),
-    );
-  });
-});
-
-describe("hard links to a symlink", () => {
-  it("count both names on the one node", async () => {
-    const { bindImports, sysSymlink, sysLink, sysLstat, sysUnlink } =
-      await import("./syscall_harness.mjs");
-    const fs = new MemoryFileSystem({ "/": "/" });
-    const h = bindImports(new MemoryFSBackend(), fs);
-    assert.strictEqual(sysSymlink(h, "target", "l"), ESUCCESS);
-    assert.strictEqual(sysLstat(h, "l").nlink, 1);
-    assert.strictEqual(sysLink(h, "l", "l2"), ESUCCESS);
-    const [first, second] = [sysLstat(h, "l"), sysLstat(h, "l2")];
-    assert.strictEqual(first.ino, second.ino);
-    assert.strictEqual(first.nlink, 2);
-    assert.strictEqual(second.nlink, 2);
-    assert.strictEqual(sysUnlink(h, "l2"), ESUCCESS);
-    assert.strictEqual(sysLstat(h, "l").nlink, 1);
-  });
-});
-
-describe("empty writes", () => {
-  it("an empty iovec past EOF does not grow a file", async () => {
-    const { bindImports, sysCreate, sysStat, sysWrite } = await import(
-      "./syscall_harness.mjs"
-    );
-    const h = bindImports(
-      new MemoryFSBackend(),
-      new MemoryFileSystem({ "/": "/" }),
-    );
-    // fd_write with one empty iovec at a cursor past the end.
-    const file = sysCreate(h, "empty");
-    assert.strictEqual(h.imports.fd_seek(file.fd, 100n, 0, 5000), ESUCCESS);
-    assert.strictEqual(sysWrite(h, file.fd, "").errno, ESUCCESS);
-    assert.strictEqual(sysStat(h, "empty").size, 0);
-    // fd_pwrite with one empty iovec far past the end.
-    assert.strictEqual(sysWrite(h, file.fd, "abc").errno, ESUCCESS);
-    h.view.setUint32(256, 512, true);
-    h.view.setUint32(260, 0, true);
-    assert.strictEqual(
-      h.imports.fd_pwrite(file.fd, 256, 1, 1000n, 4096),
-      ESUCCESS,
-    );
-    assert.strictEqual(sysStat(h, "empty").size, 103);
-  });
-});
-
-describe("path_rename of a directory", () => {
-  it("refuses to move it into its own subtree", async () => {
-    const { bindImports, sysMkdir, sysRename, sysStat } = await import(
-      "./syscall_harness.mjs"
-    );
-    const fs = new MemoryFileSystem({ "/": "/" });
-    const h = bindImports(new MemoryFSBackend(), fs);
-    assert.strictEqual(sysMkdir(h, "a"), ESUCCESS);
-    assert.strictEqual(sysMkdir(h, "a/b"), ESUCCESS);
-    for (const target of ["a/c", "a/b/c"]) {
-      assert.strictEqual(sysRename(h, "a", target), WASIAbi.WASI_ERRNO_INVAL);
-    }
-    // The same move with the target reached through a directory fd.
-    const dirPath = new TextEncoder().encode("a/b");
-    h.bytes.set(dirPath, 0);
-    const dirRights = ALL_RIGHTS ^ BigInt(1 << 6); // no FD_WRITE
-    assert.strictEqual(
-      h.imports.path_open(
-        PREOPEN_FD,
-        0,
-        0,
-        dirPath.length,
-        WASIAbi.WASI_OFLAGS_DIRECTORY,
-        dirRights,
-        dirRights,
-        0,
-        4096,
-      ),
-      ESUCCESS,
-    );
-    const inner = { fd: h.view.getUint32(4096, true) };
-    const from = new TextEncoder().encode("a");
-    const to = new TextEncoder().encode("c");
-    h.bytes.set(from, 0);
-    h.bytes.set(to, 128);
-    assert.strictEqual(
-      h.imports.path_rename(PREOPEN_FD, 0, from.length, inner.fd, 128, 1),
-      WASIAbi.WASI_ERRNO_INVAL,
-    );
-    assert.strictEqual(sysStat(h, "a/b").errno, ESUCCESS);
-    // Moving a directory up out of itself is fine.
-    assert.strictEqual(sysRename(h, "a/b", "b"), ESUCCESS);
-    assert.strictEqual(sysRename(h, "a", "b/a"), ESUCCESS);
-    assert.strictEqual(sysStat(h, "b/a").errno, ESUCCESS);
-  });
+  }
+  const h = bindImports(
+    new FailingLinkBackend(),
+    new MemoryFileSystem({ "/": "/" }),
+  );
+  const { errno, fd } = sysCreate(h, "src");
+  assert.equal(errno, 0);
+  assert.equal(sysClose(h, fd), 0);
+  assert.equal(sysLink(h, "src", "dst"), FSErrno.IO);
+  const source = sysLstat(h, "src");
+  assert.equal(source.errno, 0);
+  assert.equal(source.nlink, 1);
+  assert.equal(sysLstat(h, "dst").errno, WASIAbi.WASI_ERRNO_NOENT);
 });

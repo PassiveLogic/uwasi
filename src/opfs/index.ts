@@ -1,4 +1,4 @@
-import { useFileSystem, StdioOptions } from "../filesystem/index.js";
+import { useFS, StdioOptions } from "../filesystem/index.js";
 import { OPFSBackend } from "./backend.js";
 export * from "./backend.js";
 
@@ -39,10 +39,10 @@ export * from "./backend.js";
 export function useOPFS(useOptions: {
   withBackend: OPFSBackend;
   withStdio?: StdioOptions;
-}): ReturnType<typeof useFileSystem> {
+}): ReturnType<typeof useFS> {
   return (...args) => {
     const backend = useOptions.withBackend;
-    return useFileSystem({
+    return useFS({
       withBackend: backend,
       withFileSystem: backend.fileSystem,
       withStdio: useOptions.withStdio,
