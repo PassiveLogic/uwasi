@@ -149,3 +149,27 @@ export function sysStat(h, name, dirfd = PREOPEN_FD) {
   const size = errno === 0 ? h.view.getBigUint64(FILESTAT_PTR + 32, true) : 0n;
   return { errno, size: Number(size) };
 }
+
+export function sysSymlink(h, target, name, dirfd = PREOPEN_FD) {
+  const targetLen = putPath(h, target, PATH_PTR);
+  const nameLen = putPath(h, name, PATH2_PTR);
+  return h.imports.path_symlink(PATH_PTR, targetLen, dirfd, PATH2_PTR, nameLen);
+}
+
+/** path_filestat_get without following a final symlink. */
+export function sysLstat(h, name, dirfd = PREOPEN_FD) {
+  const len = putPath(h, name);
+  const errno = h.imports.path_filestat_get(
+    dirfd,
+    0,
+    PATH_PTR,
+    len,
+    FILESTAT_PTR,
+  );
+  if (errno !== 0) return { errno };
+  return {
+    errno,
+    ino: h.view.getBigUint64(FILESTAT_PTR + 8, true),
+    nlink: Number(h.view.getBigUint64(FILESTAT_PTR + 24, true)),
+  };
+}

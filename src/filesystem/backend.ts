@@ -31,7 +31,12 @@ export interface FSBackend {
   writeAt(node: FileNode, data: Uint8Array, offset: number): number;
   /** Truncate or zero-fill-extend the file to `size`. Returns an errno. */
   resize(node: FileNode, size: number): number;
-  /** Flush data and metadata for `fd_sync`. Returns an errno. */
+  /**
+   * Flush data and metadata for `fd_sync`. Returns an errno. On a
+   * directory, every namespace change that has succeeded must be durable
+   * when this returns. A backend whose namespace methods make each change
+   * durable before they return has nothing left to do here.
+   */
   sync(node: FileNode | DirectoryNode): number;
   /** Flush data for `fd_datasync`. Returns an errno. */
   datasync(node: FileNode | DirectoryNode): number;
@@ -39,13 +44,27 @@ export interface FSBackend {
   openFile(node: FileNode): number;
   /** The fd over this file was closed; release any handle. */
   closeFile(node: FileNode): void;
-  /** Link `node` into `parent` under `name`. Returns an errno. */
+  /**
+   * Link `node` into `parent` under `name`. Returns an errno.
+   *
+   * The syscall layer keeps every `nlink`; a backend reads it but never
+   * changes it. A create passes a new node: a directory, or a node whose
+   * `nlink` is 1. `path_link` passes an existing node, any but a
+   * directory, whose `nlink` it has already raised to count the new name,
+   * so it is above 1, and lowers it again if this returns an error or
+   * throws. A backend without hard links tells a link from a create that
+   * way and returns `NOTSUP`.
+   */
   createChild(parent: DirectoryNode, name: string, node: FSNode): number;
-  /** Unlink `name` from `parent`. Returns an errno. */
+  /**
+   * Unlink `name` from `parent`. Returns an errno. The caller lowers the
+   * node's `nlink` once this succeeds.
+   */
   removeChild(parent: DirectoryNode, name: string): number;
   /**
    * Move the node at `fromName` to `toName`, replacing any node already
-   * there. Returns an errno.
+   * there. Returns an errno. The caller lowers a replaced node's `nlink`
+   * once this succeeds.
    */
   renameChild(
     fromParent: DirectoryNode,

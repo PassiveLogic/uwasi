@@ -104,6 +104,20 @@ function filetypeOf(node: FSNode): number {
   }
 }
 
+/** Whether `dir` is `root` itself or lies anywhere inside its subtree. */
+function isWithin(dir: DirectoryNode, root: DirectoryNode): boolean {
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current === dir) return true;
+    for (const name of Object.keys(current.entries)) {
+      const child = current.entries[name];
+      if (child.type === "dir") pending.push(child);
+    }
+  }
+  return false;
+}
+
 const MEMFS_DEV = BigInt(1);
 
 function statOf(
@@ -120,9 +134,9 @@ function statOf(
 } {
   let size = 0;
   let nlink = 1;
+  if (node.type !== "dir") nlink = node.nlink;
   if (node.type === "file") {
     size = backend.fileSize(node);
-    nlink = node.nlink;
   } else if (node.type === "symlink") {
     size = new TextEncoder().encode(node.target).byteLength;
   }
@@ -178,7 +192,7 @@ export function bindFSSyscalls(
 
   bindStdio(withStdio).forEach((entry, fd) => {
     files.set(fd, {
-      node: stampMeta({ type: "character", kind: "stdio", entry }),
+      node: stampMeta({ type: "character", kind: "stdio", entry, nlink: 1 }),
       position: 0,
       fdflags: 0,
       rightsBase:
@@ -683,14 +697,18 @@ export function bindFSSyscalls(
       if (target.trailingSlash) return WASIAbi.WASI_ERRNO_NOENT;
       if (target.node) return WASIAbi.WASI_ERRNO_EXIST;
       if (!target.parent || !target.name) return WASIAbi.WASI_ERRNO_NOENT;
-      const errno = backend.createChild(
-        target.parent,
-        target.name,
-        source.node,
-      );
-      if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (source.node.type === "file") source.node.nlink++;
-      return WASIAbi.WASI_ESUCCESS;
+      // Counted before the backend sees the node, so a backend without
+      // hard links can tell a second name from a new node by `nlink`.
+      // Undone unless the link succeeds, even if the backend throws.
+      const counted = source.node;
+      counted.nlink++;
+      let errno: number = WASIAbi.WASI_ERRNO_IO;
+      try {
+        errno = backend.createChild(target.parent, target.name, counted);
+      } finally {
+        if (errno !== WASIAbi.WASI_ESUCCESS) counted.nlink--;
+      }
+      return errno;
     },
 
     path_open: (
@@ -843,6 +861,13 @@ export function bindFSSyscalls(
         return WASIAbi.WASI_ERRNO_NOTDIR;
       }
       if (target.node === source.node) return WASIAbi.WASI_ESUCCESS;
+      // Moving a directory into its own subtree would detach it into a
+      // cycle no path reaches. The target's directory may have been
+      // reached through another fd or a symlink, so search the subtree
+      // rather than compare paths.
+      if (source.node.type === "dir" && isWithin(target.parent, source.node)) {
+        return WASIAbi.WASI_ERRNO_INVAL;
+      }
       if (target.node) {
         if (source.node.type === "dir") {
           if (target.node.type !== "dir") return WASIAbi.WASI_ERRNO_NOTDIR;
@@ -860,7 +885,7 @@ export function bindFSSyscalls(
         target.name,
       );
       if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (target.node !== null && target.node.type === "file") {
+      if (target.node !== null && target.node.type !== "dir") {
         target.node.nlink--;
       }
       return WASIAbi.WASI_ESUCCESS;
@@ -908,7 +933,7 @@ export function bindFSSyscalls(
       }
       const errno = backend.removeChild(resolved.parent, resolved.name);
       if (errno !== WASIAbi.WASI_ESUCCESS) return errno;
-      if (resolved.node.type === "file") resolved.node.nlink--;
+      resolved.node.nlink--;
       return WASIAbi.WASI_ESUCCESS;
     },
 

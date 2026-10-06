@@ -174,4 +174,141 @@ describe("fd.bindFSSyscalls backend seam", () => {
     );
     assert.ok(backend.calls.includes("removeChild"));
   });
+
+  it("path_link undoes its nlink count when createChild throws", () => {
+    class ThrowingLinkBackend extends MemoryFSBackend {
+      createChild(parent, name, node) {
+        if (node.type === "file" && node.nlink > 1) {
+          throw new Error("backend bug");
+        }
+        return super.createChild(parent, name, node);
+      }
+    }
+    const h = makeSeam(new ThrowingLinkBackend());
+    assert.strictEqual(h.imports.fd_close(openFile(h, "src")), ESUCCESS);
+    const encoder = new TextEncoder();
+    const from = encoder.encode("src");
+    const to = encoder.encode("dst");
+    h.bytes.set(from, PATH_PTR);
+    h.bytes.set(to, PATH_PTR + 64);
+    assert.throws(
+      () =>
+        h.imports.path_link(
+          PREOPEN_FD,
+          0,
+          PATH_PTR,
+          from.length,
+          PREOPEN_FD,
+          PATH_PTR + 64,
+          to.length,
+        ),
+      /backend bug/,
+    );
+    // path_filestat_get: nlink is the u64 at offset 24 of the filestat.
+    h.bytes.set(from, PATH_PTR);
+    assert.strictEqual(
+      h.imports.path_filestat_get(
+        PREOPEN_FD,
+        0,
+        PATH_PTR,
+        from.length,
+        OUT_PTR,
+      ),
+      ESUCCESS,
+    );
+    assert.strictEqual(h.view.getBigUint64(OUT_PTR + 24, true), 1n);
+  });
+});
+
+describe("MemoryFileSystem directory entries", () => {
+  it("names shadowing Object.prototype members are ordinary entries", async () => {
+    const { bindImports, sysCreate, sysClose, sysStat, sysMkdir } =
+      await import("./syscall_harness.mjs");
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const backend = new MemoryFSBackend();
+    const h = bindImports(backend, fs);
+    const names = ["constructor", "__proto__", "toString", "hasOwnProperty"];
+    for (const name of names) {
+      assert.strictEqual(sysStat(h, name).errno, WASIAbi.WASI_ERRNO_NOENT);
+      const { errno, fd } = sysCreate(h, name);
+      assert.strictEqual(errno, ESUCCESS, `creating ${name}`);
+      assert.strictEqual(sysClose(h, fd), ESUCCESS);
+      assert.strictEqual(sysStat(h, name).errno, ESUCCESS);
+    }
+    assert.strictEqual(sysMkdir(h, "__defineGetter__"), ESUCCESS);
+    fs.addFile("/__defineGetter__/constructor", "seeded");
+    assert.strictEqual(sysStat(h, "__defineGetter__/constructor").size, 6);
+    assert.deepStrictEqual(
+      backend
+        .listChildren(fs.lookup("/"))
+        .filter((n) => n !== "dev")
+        .sort(),
+      [...names, "__defineGetter__"].sort(),
+    );
+  });
+});
+
+describe("hard links to a symlink", () => {
+  it("count both names on the one node", async () => {
+    const { bindImports, sysSymlink, sysLink, sysLstat, sysUnlink } =
+      await import("./syscall_harness.mjs");
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const h = bindImports(new MemoryFSBackend(), fs);
+    assert.strictEqual(sysSymlink(h, "target", "l"), ESUCCESS);
+    assert.strictEqual(sysLstat(h, "l").nlink, 1);
+    assert.strictEqual(sysLink(h, "l", "l2"), ESUCCESS);
+    const [first, second] = [sysLstat(h, "l"), sysLstat(h, "l2")];
+    assert.strictEqual(first.ino, second.ino);
+    assert.strictEqual(first.nlink, 2);
+    assert.strictEqual(second.nlink, 2);
+    assert.strictEqual(sysUnlink(h, "l2"), ESUCCESS);
+    assert.strictEqual(sysLstat(h, "l").nlink, 1);
+  });
+});
+
+describe("path_rename of a directory", () => {
+  it("refuses to move it into its own subtree", async () => {
+    const { bindImports, sysMkdir, sysRename, sysStat } = await import(
+      "./syscall_harness.mjs"
+    );
+    const fs = new MemoryFileSystem({ "/": "/" });
+    const h = bindImports(new MemoryFSBackend(), fs);
+    assert.strictEqual(sysMkdir(h, "a"), ESUCCESS);
+    assert.strictEqual(sysMkdir(h, "a/b"), ESUCCESS);
+    for (const target of ["a/c", "a/b/c"]) {
+      assert.strictEqual(sysRename(h, "a", target), WASIAbi.WASI_ERRNO_INVAL);
+    }
+    // The same move with the target reached through a directory fd.
+    const dirPath = new TextEncoder().encode("a/b");
+    h.bytes.set(dirPath, 0);
+    const dirRights = ALL_RIGHTS ^ BigInt(1 << 6); // no FD_WRITE
+    assert.strictEqual(
+      h.imports.path_open(
+        PREOPEN_FD,
+        0,
+        0,
+        dirPath.length,
+        WASIAbi.WASI_OFLAGS_DIRECTORY,
+        dirRights,
+        dirRights,
+        0,
+        4096,
+      ),
+      ESUCCESS,
+    );
+    const inner = { fd: h.view.getUint32(4096, true) };
+    const from = new TextEncoder().encode("a");
+    const to = new TextEncoder().encode("c");
+    h.bytes.set(from, 0);
+    h.bytes.set(to, 128);
+    assert.strictEqual(
+      h.imports.path_rename(PREOPEN_FD, 0, from.length, inner.fd, 128, 1),
+      WASIAbi.WASI_ERRNO_INVAL,
+    );
+    assert.strictEqual(sysStat(h, "a/b").errno, ESUCCESS);
+    // Moving a directory up out of itself is fine.
+    assert.strictEqual(sysRename(h, "a/b", "b"), ESUCCESS);
+    assert.strictEqual(sysRename(h, "a", "b/a"), ESUCCESS);
+    assert.strictEqual(sysStat(h, "b/a").errno, ESUCCESS);
+  });
 });

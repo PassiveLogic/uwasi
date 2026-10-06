@@ -213,7 +213,9 @@ push them to storage. Creating files is synchronous thanks to a pool of
 pre-created spares (`spareFiles` option, default 16); a burst that creates
 more files than that stays correct but defers content durability until the
 event loop turns (`fd_sync` fails honestly with `NOSPC` until then, and
-`await backend.settle()` catches the pool up). Hard links return `NOTSUP`.
+`await backend.settle()` catches the pool up). Hard links return `NOTSUP`,
+as do linking, renaming, replacing and unlinking device nodes such as
+`/dev/null`, which the runtime recreates at every open.
 
 ### Custom storage backends
 
@@ -244,8 +246,8 @@ is provided by `useMemoryFS` (in-memory) and `useOPFS` (durable, browser
 workers), both validated against the full
 [wasi-testsuite](https://github.com/WebAssembly/wasi-testsuite) with zero
 skipped cases using the in-memory backend and an OPFS mock, not a real browser
-(`useOPFS` differs only in refusing hard links with
-`NOTSUP`); `useStdio` provides the stdio subset only.
+(`useOPFS` differs only in refusing hard links and changes to device nodes
+with `NOTSUP`); `useStdio` provides the stdio subset only.
 
 | Syscall | Status | Notes |
 |-------|----------|---------|
@@ -255,7 +257,7 @@ skipped cases using the in-memory backend and an OPFS mock, not a real browser
 | `fd_advise` | ✅ | Validates the advice; otherwise a no-op |
 | `fd_allocate` | ✅ | Grows the file to `offset + len`, never shrinks |
 | `fd_close` | ✅ | Preopens are closable |
-| `fd_datasync` / `fd_sync` | ✅ | Memory FS: no-op success (memory is always "synced"); OPFS: a real `flush()` of the sync access handle |
+| `fd_datasync` / `fd_sync` | ✅ | Memory FS: no-op success (memory is always "synced"); OPFS: a real `flush()` of the file's sync access handle; on a directory, success at once, since every guest namespace change is durable when its syscall returns; it does not record host-seeded files (see `persistAll()`) |
 | `fd_fdstat_get` | ✅ | Reports real per-fd flags and rights |
 | `fd_fdstat_set_flags` | ✅ | `APPEND` honored by `fd_write` |
 | `fd_fdstat_set_rights` | ✅ | Rights may only shrink (`NOTCAPABLE` otherwise) |
@@ -271,7 +273,7 @@ skipped cases using the in-memory backend and an OPFS mock, not a real browser
 | `path_create_directory` | ✅ | Single level; parent must exist |
 | `path_filestat_get` | ✅ | `SYMLINK_FOLLOW` honored |
 | `path_filestat_set_times` | ✅ | Symlink-aware (lstat-level timestamps) |
-| `path_link` | ✅ | Memory FS: hard links with shared inode and `nlink` accounting; OPFS: `NOTSUP` (one name per file in the durable namespace record) |
+| `path_link` | ✅ | Memory FS: hard links with shared inode and `nlink` accounting; OPFS: `NOTSUP` for files and symlinks (one name per node in the durable namespace record) |
 | `path_open` | ✅ | Full `oflags`/`fdflags`/rights semantics; sandboxed path resolution |
 | `path_readlink` | ✅ | Silent truncation to the buffer, no NUL |
 | `path_remove_directory` | ✅ | `NOTEMPTY` on non-empty directories |

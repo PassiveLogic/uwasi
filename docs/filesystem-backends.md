@@ -68,7 +68,11 @@ results and report storage failures by throwing `FSError(errno, cause?)`.
 The shared syscall boundary converts only that error type to a WASI errno;
 unexpected exceptions still propagate. A failed read is not reported as EOF,
 and a failed size lookup is not reported as an empty file. Link counts change
-only after a namespace operation succeeds.
+only after a namespace operation succeeds, except in `path_link`: it raises the
+source node's `nlink` before it calls `createChild`, so a backend without hard
+links can refuse a second name for an existing node, and lowers it again if the
+link fails. Every node but a directory carries `nlink`, symlinks and device
+nodes included.
 
 The error must come from the same uwasi module instance as the provider because
 recognition uses constructor identity. Avoid mixing ESM/CJS instances or duplicate
@@ -106,7 +110,9 @@ make such an alias resolvable by Node or a browser.
 
 The OPFS on-disk metadata and data-file formats are unchanged. Sync access handles
 still require a worker and exclusive ownership by one live backend. Hard links
-remain unsupported; inode numbers and timestamps are not persisted. Async startup,
+remain unsupported, and so are links, renames and unlinks of device nodes such
+as `/dev/null`, which the runtime recreates at every open; both return `NOTSUP`.
+Inode numbers and timestamps are not persisted. Async startup,
 spare-handle pooling, pending file materialization, `settle()`, sync errors during
 pool exhaustion, metadata recovery, and destructive unlink ordering are unchanged.
 Memory storage keeps its existing capacity, zero-fill, aliasing, and resizable
